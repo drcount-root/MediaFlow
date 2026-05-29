@@ -62,7 +62,7 @@ Use explicit env vars per app so Docker/local runs are predictable.
 ```txt
 APP_ENV=local
 HTTP_ADDR=:8080
-DATABASE_URL=postgres://mediaflow:mediaflow@localhost:5432/mediaflow?sslmode=disable
+DATABASE_URL=postgres://mediaflow:mediaflow@localhost:55432/mediaflow?sslmode=disable
 RABBITMQ_URL=amqp://mediaflow:mediaflow@localhost:5672/
 REDIS_ADDR=localhost:6379
 MINIO_ENDPOINT=localhost:9000
@@ -79,7 +79,7 @@ MAX_UPLOAD_BYTES=524288000
 
 ```txt
 APP_ENV=local
-DATABASE_URL=postgres://mediaflow:mediaflow@localhost:5432/mediaflow?sslmode=disable
+DATABASE_URL=postgres://mediaflow:mediaflow@localhost:55432/mediaflow?sslmode=disable
 RABBITMQ_URL=amqp://mediaflow:mediaflow@localhost:5672/
 MINIO_ENDPOINT=localhost:9000
 MINIO_ACCESS_KEY=mediaflow
@@ -834,7 +834,8 @@ Required local services:
 
 ```txt
 postgres
-  port: 5432
+  host port: 55432
+  container port: 5432
   database: mediaflow
   user: mediaflow
   password: mediaflow

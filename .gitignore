@@ -1,0 +1,40 @@
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.*
+!.env.example
+!apps/**/.env.example
+
+# Logs
+*.log
+logs/
+
+# Build output
+dist/
+build/
+coverage/
+
+# Node
+node_modules/
+.next/
+out/
+
+# Go
+bin/
+*.test
+
+# Local media/output
+tmp/
+uploads/
+processed/
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.ts
+*.m3u8
+

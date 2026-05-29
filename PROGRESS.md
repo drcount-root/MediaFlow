@@ -4,20 +4,20 @@ Last updated: 2026-05-29
 
 ## Overall Status
 
-Status: Planning complete, implementation not started.
+Status: Milestone 0 complete. Ready for Milestone 1.
 
 Current focus:
 
 ```txt
-Milestone 0: Repository and local infrastructure scaffold
+Milestone 1: API upload path
 ```
 
 ## Milestones
 
 | Milestone | Status | Notes |
 | --- | --- | --- |
-| 0. Repo and Infra | Not started | Create folders, Docker Compose, migrations, local README. |
-| 1. API Upload Path | Not started | Upload MP4, store raw file, save metadata, publish queue job. |
+| 0. Repo and Infra | Done | Scaffold, Compose file, env examples, migration, README, and live dependency startup verified. |
+| 1. API Upload Path | In progress | Go API scaffold and health endpoint are working. Upload dependencies and endpoint are next. |
 | 2. Worker Transcoding Path | Not started | Consume job, run FFmpeg, create HLS, upload processed outputs. |
 | 3. Web Playback Path | Not started | Upload UI, status page, HLS watch page. |
 | 4. Hardening | Not started | Retries, errors, logs, validation, docs. |
@@ -26,26 +26,27 @@ Milestone 0: Repository and local infrastructure scaffold
 
 ### Milestone 0: Repo and Infra
 
-- [ ] Create `apps/api`
-- [ ] Create `apps/worker`
-- [ ] Create `apps/web`
-- [ ] Create `packages/shared`
-- [ ] Create `infrastructure/migrations`
-- [ ] Add Docker Compose for PostgreSQL
-- [ ] Add Docker Compose for RabbitMQ
-- [ ] Add Docker Compose for Redis
-- [ ] Add Docker Compose for MinIO
-- [ ] Add MinIO bucket setup for `mediaflow-raw`
-- [ ] Add MinIO bucket setup for `mediaflow-processed`
-- [ ] Add MinIO bucket setup for `mediaflow-thumbnails`
-- [ ] Add initial database migration
-- [ ] Add local environment examples
-- [ ] Add root README with startup instructions
+- [x] Create `apps/api`
+- [x] Create `apps/worker`
+- [x] Create `apps/web`
+- [x] Create `packages/shared`
+- [x] Create `infrastructure/migrations`
+- [x] Add Docker Compose for PostgreSQL
+- [x] Add Docker Compose for RabbitMQ
+- [x] Add Docker Compose for Redis
+- [x] Add Docker Compose for MinIO
+- [x] Add MinIO bucket setup for `mediaflow-raw`
+- [x] Add MinIO bucket setup for `mediaflow-processed`
+- [x] Add MinIO bucket setup for `mediaflow-thumbnails`
+- [x] Add initial database migration
+- [x] Add local environment examples
+- [x] Add root README with startup instructions
+- [x] Verify Docker Compose dependencies start locally
 
 ### Milestone 1: API Upload Path
 
-- [ ] Initialize Go API app
-- [ ] Add health endpoint
+- [x] Initialize Go API app
+- [x] Add health endpoint
 - [ ] Add database connection
 - [ ] Add migration runner or migration command
 - [ ] Add MinIO client

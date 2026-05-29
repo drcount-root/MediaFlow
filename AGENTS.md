@@ -26,9 +26,14 @@ docker compose -f infrastructure/docker-compose.yml up
 Starts PostgreSQL, RabbitMQ, Redis, and MinIO.
 
 ```bash
-go test ./...
+cd apps/api && go test ./...
 ```
-Runs Go API and worker tests.
+Runs Go API tests.
+
+```bash
+cd apps/api && go run ./cmd/api
+```
+Runs the API server on `localhost:8080`.
 
 ```bash
 npm run dev

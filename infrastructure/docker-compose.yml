@@ -78,7 +78,9 @@ services:
       mc alias set local http://minio:9000 mediaflow mediaflow-secret &&
       mc mb --ignore-existing local/mediaflow-raw &&
       mc mb --ignore-existing local/mediaflow-processed &&
-      mc mb --ignore-existing local/mediaflow-thumbnails
+      mc mb --ignore-existing local/mediaflow-thumbnails &&
+      mc anonymous set download local/mediaflow-processed &&
+      mc anonymous set download local/mediaflow-thumbnails
       "
 
 volumes:

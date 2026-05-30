@@ -41,6 +41,12 @@ cd apps/api && go run ./cmd/migrate
 Applies pending SQL migrations from `infrastructure/migrations`.
 
 ```bash
+cd apps/worker && go test ./...
+cd apps/worker && go run ./cmd/worker
+```
+Runs worker tests and starts the RabbitMQ-backed FFmpeg worker.
+
+```bash
 npm run dev
 npm test
 npm run lint

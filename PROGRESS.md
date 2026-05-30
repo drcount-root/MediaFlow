@@ -4,12 +4,12 @@ Last updated: 2026-05-30
 
 ## Overall Status
 
-Status: Milestone 1 complete. Ready for Milestone 2.
+Status: Milestone 2 complete. Ready for Milestone 3.
 
 Current focus:
 
 ```txt
-Milestone 2: Worker transcoding path
+Milestone 3: Web playback path
 ```
 
 ## Milestones
@@ -18,7 +18,7 @@ Milestone 2: Worker transcoding path
 | --- | --- | --- |
 | 0. Repo and Infra | Done | Scaffold, Compose file, env examples, migration, README, and live dependency startup verified. |
 | 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
-| 2. Worker Transcoding Path | Not started | Consume job, run FFmpeg, create HLS, upload processed outputs. |
+| 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
 | 3. Web Playback Path | Not started | Upload UI, status page, HLS watch page. |
 | 4. Hardening | Not started | Retries, errors, logs, validation, docs. |
 
@@ -63,27 +63,27 @@ Milestone 2: Worker transcoding path
 
 ### Milestone 2: Worker Transcoding Path
 
-- [ ] Initialize worker app
-- [ ] Add RabbitMQ consumer
-- [ ] Add database connection
-- [ ] Add MinIO client
-- [ ] Claim queued job safely
-- [ ] Update video status to `processing`
-- [ ] Download raw video to temp directory
-- [ ] Run `ffprobe`
-- [ ] Save duration and metadata
-- [ ] Generate thumbnail with FFmpeg
-- [ ] Generate HLS master manifest
-- [ ] Generate 720p variant
-- [ ] Generate 480p variant
-- [ ] Generate 360p variant if source allows
-- [ ] Upload HLS output to MinIO
-- [ ] Upload thumbnail to MinIO
-- [ ] Insert `video_variants`
-- [ ] Update video status to `ready`
-- [ ] Mark job `completed`
-- [ ] Handle failures and update status to `failed`
-- [ ] Add worker tests
+- [x] Initialize worker app
+- [x] Add RabbitMQ consumer
+- [x] Add database connection
+- [x] Add MinIO client
+- [x] Claim queued job safely
+- [x] Update video status to `processing`
+- [x] Download raw video to temp directory
+- [x] Run `ffprobe`
+- [x] Save duration and metadata
+- [x] Generate thumbnail with FFmpeg
+- [x] Generate HLS master manifest
+- [x] Generate 720p variant
+- [x] Generate 480p variant
+- [x] Generate 360p variant if source allows
+- [x] Upload HLS output to MinIO
+- [x] Upload thumbnail to MinIO
+- [x] Insert `video_variants`
+- [x] Update video status to `ready`
+- [x] Mark job `completed`
+- [x] Handle failures and update status to `failed`
+- [x] Add worker tests
 
 ### Milestone 3: Web Playback Path
 
@@ -130,9 +130,7 @@ Milestone 2: Worker transcoding path
 
 ## Open Questions
 
-- Should the worker be Go from day one, or Python for faster FFmpeg scripting?
-- Should playback use presigned MinIO URLs or API-proxied URLs in the MVP?
-- Which migration tool should be used: Goose, golang-migrate, or another tool?
+- Should playback use presigned MinIO URLs long-term, API-proxied URLs, or manifest rewriting with signed variant URLs?
 - Should SQL access use `database/sql`, `sqlc`, or an ORM?
 
 ## Update Rules

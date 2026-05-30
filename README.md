@@ -77,6 +77,24 @@ Health check:
 curl http://localhost:8080/health
 ```
 
+## Worker
+
+Run tests:
+
+```bash
+cd apps/worker
+go test ./...
+```
+
+Run the worker:
+
+```bash
+cd apps/worker
+go run ./cmd/worker
+```
+
+The worker consumes `video.transcode`, downloads the raw MP4 from MinIO, generates thumbnail and HLS outputs with FFmpeg, uploads processed assets, and marks the video `ready`.
+
 ## Current Status
 
-Milestones 0 and 1 are complete. The next focus is Milestone 2: the worker transcoding path.
+Milestones 0, 1, and 2 are complete. The next focus is Milestone 3: the web upload/status/watch experience.

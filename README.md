@@ -46,7 +46,14 @@ The initial schema is in:
 infrastructure/migrations/000001_init.sql
 ```
 
-A migration runner will be added when the API scaffold is implemented.
+Run migrations manually:
+
+```bash
+cd apps/api
+go run ./cmd/migrate
+```
+
+Docker Compose also applies the initial schema on first Postgres volume creation.
 
 ## API
 
@@ -72,4 +79,4 @@ curl http://localhost:8080/health
 
 ## Current Status
 
-Milestone 0 is complete. Milestone 1 has started with the Go API scaffold and health endpoint.
+Milestones 0 and 1 are complete. The next focus is Milestone 2: the worker transcoding path.

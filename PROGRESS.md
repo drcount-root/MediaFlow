@@ -1,15 +1,15 @@
 # MediaFlow Progress Tracker
 
-Last updated: 2026-05-29
+Last updated: 2026-05-30
 
 ## Overall Status
 
-Status: Milestone 0 complete. Ready for Milestone 1.
+Status: Milestone 1 complete. Ready for Milestone 2.
 
 Current focus:
 
 ```txt
-Milestone 1: API upload path
+Milestone 2: Worker transcoding path
 ```
 
 ## Milestones
@@ -17,7 +17,7 @@ Milestone 1: API upload path
 | Milestone | Status | Notes |
 | --- | --- | --- |
 | 0. Repo and Infra | Done | Scaffold, Compose file, env examples, migration, README, and live dependency startup verified. |
-| 1. API Upload Path | In progress | Go API scaffold and health endpoint are working. Upload dependencies and endpoint are next. |
+| 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
 | 2. Worker Transcoding Path | Not started | Consume job, run FFmpeg, create HLS, upload processed outputs. |
 | 3. Web Playback Path | Not started | Upload UI, status page, HLS watch page. |
 | 4. Hardening | Not started | Retries, errors, logs, validation, docs. |
@@ -47,19 +47,19 @@ Milestone 1: API upload path
 
 - [x] Initialize Go API app
 - [x] Add health endpoint
-- [ ] Add database connection
-- [ ] Add migration runner or migration command
-- [ ] Add MinIO client
-- [ ] Add RabbitMQ publisher
-- [ ] Add upload request validation
-- [ ] Store original MP4 in MinIO
-- [ ] Create `videos` row
-- [ ] Create `video_jobs` row
-- [ ] Publish `video.transcode` job
-- [ ] Add `GET /videos`
-- [ ] Add `GET /videos/:id`
-- [ ] Add `GET /videos/:id/playback`
-- [ ] Add API tests
+- [x] Add database connection
+- [x] Add migration runner or migration command
+- [x] Add MinIO client
+- [x] Add RabbitMQ publisher
+- [x] Add upload request validation
+- [x] Store original MP4 in MinIO
+- [x] Create `videos` row
+- [x] Create `video_jobs` row
+- [x] Publish `video.transcode` job
+- [x] Add `GET /videos`
+- [x] Add `GET /videos/:id`
+- [x] Add `GET /videos/:id/playback`
+- [x] Add API tests
 
 ### Milestone 2: Worker Transcoding Path
 

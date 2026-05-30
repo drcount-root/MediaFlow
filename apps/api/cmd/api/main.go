@@ -11,14 +11,52 @@ import (
 	"time"
 
 	"mediaflow/apps/api/internal/config"
+	"mediaflow/apps/api/internal/database"
 	httpapi "mediaflow/apps/api/internal/http"
+	"mediaflow/apps/api/internal/queue"
+	"mediaflow/apps/api/internal/storage"
+	"mediaflow/apps/api/internal/videos"
 )
 
 func main() {
 	cfg := config.Load()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	router := httpapi.NewRouter(cfg)
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer startupCancel()
+
+	db, err := database.Open(startupCtx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("database connection failed", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	objectStorage, err := storage.NewMinIOStorage(
+		cfg.MinIOEndpoint,
+		cfg.MinIOAccessKey,
+		cfg.MinIOSecretKey,
+		cfg.MinIOUseSSL,
+		cfg.MinIORawBucket,
+		cfg.MinIOProcessedBucket,
+		cfg.MinIOThumbnailBucket,
+	)
+	if err != nil {
+		logger.Error("minio client setup failed", "error", err)
+		os.Exit(1)
+	}
+
+	publisher, err := queue.NewRabbitPublisher(cfg.RabbitMQURL)
+	if err != nil {
+		logger.Error("rabbitmq publisher setup failed", "error", err)
+		os.Exit(1)
+	}
+	defer publisher.Close()
+
+	repo := database.NewPostgresRepository(db)
+	videoService := videos.NewService(repo, objectStorage, publisher, cfg.MinIORawBucket, cfg.MaxUploadBytes)
+
+	router := httpapi.NewRouterWithVideos(cfg, videoService)
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,

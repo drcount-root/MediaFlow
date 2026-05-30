@@ -18,7 +18,7 @@ Keep service-specific code inside its app folder. Put database migrations under 
 
 ## Build, Test, and Development Commands
 
-The repo is currently pre-scaffold. Use these command names once tooling is added:
+Use these commands for the current scaffold:
 
 ```bash
 docker compose -f infrastructure/docker-compose.yml up
@@ -34,6 +34,11 @@ Runs Go API tests.
 cd apps/api && go run ./cmd/api
 ```
 Runs the API server on `localhost:8080`.
+
+```bash
+cd apps/api && go run ./cmd/migrate
+```
+Applies pending SQL migrations from `infrastructure/migrations`.
 
 ```bash
 npm run dev

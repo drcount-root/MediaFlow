@@ -95,6 +95,35 @@ go run ./cmd/worker
 
 The worker consumes `video.transcode`, downloads the raw MP4 from MinIO, generates thumbnail and HLS outputs with FFmpeg, uploads processed assets, and marks the video `ready`.
 
+## Web
+
+Install dependencies:
+
+```bash
+cd apps/web
+npm install
+```
+
+Run locally:
+
+```bash
+cd apps/web
+npm run dev
+```
+
+Open:
+
+```txt
+http://localhost:3000
+```
+
+Build check:
+
+```bash
+cd apps/web
+npm run build
+```
+
 ## Current Status
 
-Milestones 0, 1, and 2 are complete. The next focus is Milestone 3: the web upload/status/watch experience.
+Milestones 0 through 3 are complete. The next focus is Milestone 4: hardening, retries, observability, and edge cases.

@@ -4,12 +4,12 @@ Last updated: 2026-05-30
 
 ## Overall Status
 
-Status: Milestone 2 complete. Ready for Milestone 3.
+Status: Milestone 3 complete. Ready for Milestone 4.
 
 Current focus:
 
 ```txt
-Milestone 3: Web playback path
+Milestone 4: Hardening
 ```
 
 ## Milestones
@@ -19,7 +19,7 @@ Milestone 3: Web playback path
 | 0. Repo and Infra | Done | Scaffold, Compose file, env examples, migration, README, and live dependency startup verified. |
 | 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
-| 3. Web Playback Path | Not started | Upload UI, status page, HLS watch page. |
+| 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, and local smoke checks. |
 | 4. Hardening | Not started | Retries, errors, logs, validation, docs. |
 
 ## Detailed Checklist
@@ -87,17 +87,17 @@ Milestone 3: Web playback path
 
 ### Milestone 3: Web Playback Path
 
-- [ ] Initialize Next.js app
-- [ ] Add API client
-- [ ] Build upload page
-- [ ] Add upload validation UI
-- [ ] Build video list page
-- [ ] Build processing status page
-- [ ] Add status polling
-- [ ] Build watch page
-- [ ] Integrate `hls.js`
-- [ ] Show playback errors clearly
-- [ ] Add frontend tests or smoke checks
+- [x] Initialize Next.js app
+- [x] Add API client
+- [x] Build upload page
+- [x] Add upload validation UI
+- [x] Build video list page
+- [x] Build processing status page
+- [x] Add status polling
+- [x] Build watch page
+- [x] Integrate `hls.js`
+- [x] Show playback errors clearly
+- [x] Add frontend tests or smoke checks
 
 ### Milestone 4: Hardening
 

@@ -48,10 +48,14 @@ Runs worker tests and starts the RabbitMQ-backed FFmpeg worker.
 
 ```bash
 npm run dev
-npm test
 npm run lint
 ```
-Runs the web app locally, executes frontend tests, and checks lint rules.
+Runs the web app locally and checks lint rules.
+
+```bash
+cd apps/web && npm run build
+```
+Runs the Next.js production build and type checks.
 
 Prefer adding a root `Makefile` later with targets such as `make dev`, `make test`, and `make lint`.
 

@@ -19,6 +19,7 @@ func NewRouterWithVideos(cfg config.Config, videoService *videos.Service) http.H
 
 	router := gin.New()
 	router.Use(gin.Recovery())
+	router.Use(corsMiddleware())
 	router.MaxMultipartMemory = cfg.MaxUploadBytes
 
 	router.GET("/health", func(ctx *gin.Context) {
@@ -34,4 +35,19 @@ func NewRouterWithVideos(cfg config.Config, videoService *videos.Service) http.H
 	}
 
 	return router
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		ctx.Header("Access-Control-Allow-Origin", "http://localhost:3000")
+		ctx.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+		ctx.Header("Access-Control-Allow-Headers", "Content-Type")
+
+		if ctx.Request.Method == http.MethodOptions {
+			ctx.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+
+		ctx.Next()
+	}
 }

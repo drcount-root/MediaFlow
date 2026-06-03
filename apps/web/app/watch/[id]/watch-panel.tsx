@@ -56,21 +56,9 @@ export function WatchPanel({ id }: { id: string }) {
             <StatusBadge status={video.status} />
           </div>
           <HlsPlayer src={playback.hlsUrl} />
-          {video.variants?.length ? (
-            <div className="panel">
-              <div className="variants">
-                {video.variants.map((variant) => (
-                  <span className="variant-chip" key={variant.quality}>
-                    {variant.quality} · {variant.width}x{variant.height}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
         </>
       ) : null}
       {!error && !video ? <div className="alert">Loading playback.</div> : null}
     </section>
   );
 }
-

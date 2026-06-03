@@ -251,33 +251,85 @@ textarea {
   gap: 20px;
 }
 
+.player-frame {
+  background: #05070a;
+  position: relative;
+}
+
 .player {
   aspect-ratio: 16 / 9;
   background: #05070a;
+  display: block;
   width: 100%;
 }
 
-.quality-bar {
-  align-items: center;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  display: flex;
-  gap: 10px;
-  justify-content: flex-end;
-  padding: 10px 12px;
+.quality-menu {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  z-index: 2;
 }
 
-.quality-bar label {
-  color: var(--muted);
+.quality-trigger {
+  align-items: center;
+  background: rgba(5, 7, 10, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  min-height: 36px;
+  padding: 7px 10px;
+}
+
+.quality-trigger span {
   font-size: 13px;
   font-weight: 700;
 }
 
-.quality-bar select {
-  background: white;
-  border: 1px solid var(--line);
-  min-height: 34px;
-  padding: 6px 30px 6px 10px;
+.quality-popover {
+  background: rgba(5, 7, 10, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: white;
+  display: grid;
+  margin-top: 8px;
+  min-width: 180px;
+  padding: 6px;
+  position: absolute;
+  right: 0;
+}
+
+.quality-option {
+  background: transparent;
+  border: 0;
+  color: white;
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.quality-option:hover,
+.quality-option.active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.quality-option span {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.quality-option small {
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 13px;
+}
+
+.quality-divider {
+  background: rgba(255, 255, 255, 0.16);
+  height: 1px;
+  margin: 4px 0;
 }
 
 .variants {
@@ -307,5 +359,17 @@ textarea {
   .page-title {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .quality-menu {
+    right: 10px;
+    top: 10px;
+  }
+
+  .quality-trigger span {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }

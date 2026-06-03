@@ -19,7 +19,7 @@ Milestone 4: Hardening
 | 0. Repo and Infra | Done | Scaffold, Compose file, env examples, migration, README, and live dependency startup verified. |
 | 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
-| 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, and local smoke checks. |
+| 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
 | 4. Hardening | Not started | Retries, errors, logs, validation, docs. |
 
 ## Detailed Checklist

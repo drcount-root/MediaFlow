@@ -257,6 +257,29 @@ textarea {
   width: 100%;
 }
 
+.quality-bar {
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  padding: 10px 12px;
+}
+
+.quality-bar label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.quality-bar select {
+  background: white;
+  border: 1px solid var(--line);
+  min-height: 34px;
+  padding: 6px 30px 6px 10px;
+}
+
 .variants {
   display: flex;
   flex-wrap: wrap;
@@ -286,4 +309,3 @@ textarea {
     flex-direction: column;
   }
 }
-

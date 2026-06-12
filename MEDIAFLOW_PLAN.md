@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a hardcore, portfolio-grade distributed video platform in two phases.
+Build a hardcore, portfolio-grade distributed video platform in phases.
 
 Phase 1 (complete) was the narrow MVP pipeline:
 
@@ -10,15 +10,24 @@ Phase 1 (complete) was the narrow MVP pipeline:
 Upload MP4 -> Queue Job -> FFmpeg creates HLS -> hls.js plays adaptive stream
 ```
 
-Phase 2 (current) turns MediaFlow into a serious system design project. Each milestone takes a real weakness that exists in the Phase 1 code today, fixes it with a canonical distributed-systems pattern, and then proves the fix under failure and load. The point is not more features; it is correctness, scalability, observability, and evidence.
+Phase 2 (current) turns MediaFlow into a serious system design project. Each milestone takes a real weakness that exists in the Phase 1 code today, fixes it with a canonical distributed-systems pattern, and then proves the fix under failure and load. Phase 3 layers product-grade full-stack systems (analytics, auth, fairness) on the proven foundation. The point is not more features; it is correctness, scalability, observability, and evidence.
 
 ```txt
-M4 Correctness under failure   -> outbox, leases, retries, DLQ, idempotency
-M5 Scalable ingest             -> presigned multipart direct-to-storage uploads
-M6 Distributed transcoding     -> fan-out renditions, aggregation, parallel workers
-M7 Serving at scale            -> signed manifests, edge cache, Redis
-M8 Observability               -> traces across the queue, metrics, dashboards
-M9 Proof                       -> SLOs, load tests, chaos experiments, postmortems
+Phase 2 — correctness, scale, proof
+  M4  CI and integration test harness  -> GitHub Actions, testcontainers
+  M5  Correctness under failure        -> outbox, leases, retries, DLQ, idempotency
+  M6  Scalable ingest                  -> presigned multipart direct-to-storage uploads
+  M7  Distributed transcoding          -> fan-out renditions, aggregation, parallel workers
+  M8  Serving at scale                 -> signed manifests, edge cache, Redis, SSE status push
+  M9  Observability                    -> traces across the queue, metrics, dashboards
+  M10 Proof                            -> SLOs, load tests, chaos drills, DR drill, postmortems
+
+Phase 3 — product-grade full stack
+  M11 Analytics and player intelligence -> watch-time pipeline, retention, storyboards
+  M12 Auth, quotas, and fairness        -> JWT auth, per-user quotas, fair scheduling
+
+Phase 4 — capstone (choose after M10)
+  Live streaming (RTMP -> live HLS) and/or Kubernetes + real cloud deploy
 ```
 
 ## Core Architecture
@@ -36,7 +45,7 @@ Frontend
   -> Frontend player loads presigned master.m3u8
 ```
 
-Target (Phase 2):
+Target (Phase 2/3):
 
 ```txt
 Frontend
@@ -44,13 +53,16 @@ Frontend
   -> Browser uploads parts directly to MinIO
   -> API completes session: video + job + outbox row in one DB transaction
   -> Outbox relay publishes to RabbitMQ (at-least-once, publisher confirms)
-  -> Planner worker: probe + thumbnail + fan out per-rendition jobs
+  -> Planner worker: probe + thumbnail + storyboard + fan out per-rendition jobs
   -> N rendition workers transcode in parallel (leases, heartbeats, retries)
   -> Finalizer assembles master manifest when the last rendition completes
+  -> Status changes pushed to the browser over SSE (Redis pub/sub fan-out)
   -> Playback: API rewrites manifests with HMAC-signed segment URLs
   -> nginx edge cache (CDN stand-in) serves segments, validates signatures
-  -> Redis: manifest cache, rate limiting, view counters
+  -> Player heartbeats -> ingest -> Redis Streams -> watch-time aggregates
+  -> Redis: manifest cache, rate limiting, counters, pub/sub, streams
   -> OpenTelemetry trace spans the whole pipeline; Prometheus + Grafana watch it
+  -> All of it gated by CI running integration tests against real dependencies
 ```
 
 ## Stack
@@ -61,12 +73,14 @@ Frontend
 | Backend API | Go + Gin |
 | Queue | RabbitMQ (TTL retry queues + DLX) |
 | Database | PostgreSQL (`database/sql` + pgx) |
-| Cache / counters / rate limiting | Redis |
+| Cache / counters / rate limiting / pub-sub / streams | Redis |
 | Object storage | MinIO locally, S3-compatible later |
 | Video processing | FFmpeg |
 | Edge cache (CDN stand-in) | nginx (`proxy_cache` + `secure_link`) |
+| Realtime status | Server-Sent Events over Redis pub/sub |
 | Tracing | OpenTelemetry + Jaeger |
 | Metrics | Prometheus + Grafana |
+| CI | GitHub Actions + testcontainers-go |
 | Load testing | k6 |
 | Local infrastructure | Docker Compose |
 | Production later | Kubernetes, real CDN |
@@ -74,7 +88,7 @@ Frontend
 ## Phase 1 Record (Shipped)
 
 Milestones 0–3 are complete; the code is the source of truth. The contracts below
-are what Phase 2 builds on and must not be broken accidentally.
+are what later phases build on and must not be broken accidentally.
 
 ### Video lifecycle
 
@@ -88,10 +102,10 @@ Each meaningful transition should write a `video_events` row.
 ### API surface
 
 ```txt
-POST   /videos/upload            # multipart proxy upload (replaced in M5)
+POST   /videos/upload            # multipart proxy upload (replaced in M6)
 GET    /videos
 GET    /videos/:id
-GET    /videos/:id/playback      # presigned master.m3u8 (replaced in M7)
+GET    /videos/:id/playback      # presigned master.m3u8 (replaced in M8)
 GET    /health
 ```
 
@@ -135,33 +149,68 @@ Skip variants above source height. H.264 + AAC, 4s MPEG-TS segments, VOD playlis
 
 These exist in the code today. Each is the seed of a milestone.
 
-1. **Dual-write problem** — `Service.Upload` (`apps/api/internal/videos/service.go`)
+1. **No CI** — nothing runs the tests automatically, and the existing tests use
+   fakes only; the DB/queue/storage integration code has no automated coverage.
+   → M4 CI + testcontainers.
+2. **Dual-write problem** — `Service.Upload` (`apps/api/internal/videos/service.go`)
    does MinIO write → DB insert → RabbitMQ publish with no transaction spanning
-   them. A failed publish strands a `queued` video forever. → M4 outbox.
-2. **Stuck-job deadlock** — if a worker dies mid-transcode, RabbitMQ redelivers,
+   them. A failed publish strands a `queued` video forever. → M5 outbox.
+3. **Stuck-job deadlock** — if a worker dies mid-transcode, RabbitMQ redelivers,
    but `ClaimJob` sees the job already claimed and skips it. The video is stuck
-   in `processing` with no recovery path. → M4 leases + reaper.
-3. **No retries** — `video_jobs.attempts` is never incremented; failures Nack
-   without requeue; there is no DLQ. → M4 retry/backoff/DLQ.
-4. **Ingest bottleneck** — the API proxies entire uploads (up to 500MB) through
-   its own memory/network; uploads are not resumable. → M5 presigned multipart.
-5. **Monolithic transcode** — one worker transcodes all renditions of a video
-   serially in a single job; horizontal scaling is coarse. → M6 fan-out.
-6. **Fake playback security** — only `master.m3u8` is presigned; variant
+   in `processing` with no recovery path. → M5 leases + reaper.
+4. **No retries** — `video_jobs.attempts` is never incremented; failures Nack
+   without requeue; there is no DLQ. → M5 retry/backoff/DLQ.
+5. **Ingest bottleneck** — the API proxies entire uploads (up to 500MB) through
+   its own memory/network; uploads are not resumable. → M6 presigned multipart.
+6. **Monolithic transcode** — one worker transcodes all renditions of a video
+   serially in a single job; horizontal scaling is coarse. → M7 fan-out.
+7. **Fake playback security** — only `master.m3u8` is presigned; variant
    playlists and segments are served from anonymous-download buckets. There is
-   no caching tier. → M7 signed manifests + edge cache.
-7. **Blind pipeline** — no traces, no metrics, no dashboards; Redis is
-   provisioned and entirely unused. → M7/M8.
-8. **No evidence** — no load tests, no chaos testing, no stated SLOs. → M9.
+   no caching tier. Status updates rely on 2s polling. → M8 signed manifests +
+   edge cache + SSE.
+8. **Blind pipeline** — no traces, no metrics, no dashboards; Redis is
+   provisioned and entirely unused. → M8/M9.
+9. **No evidence** — no load tests, no chaos testing, no backup story, no
+   stated SLOs. → M10.
 
 ---
 
-## Milestone 4: Correctness Under Failure
+## Milestone 4: CI and Integration Test Harness
+
+Everything after this milestone is judged by a pipeline, not by "works on my
+machine". Built first because every later milestone (outbox, reaper, fan-out)
+is exactly the kind of infrastructure-coupled code that unit tests with fakes
+cannot validate.
+
+### Design
+
+- GitHub Actions workflow on every push/PR:
+  - `apps/api`: `gofmt` check, `go vet`, `go test ./...`
+  - `apps/worker`: same, with `ffmpeg`/`ffprobe` installed in the runner
+  - `apps/web`: `npm run lint`, `npm run build`
+- Integration test suite (build tag `integration`) using `testcontainers-go`
+  to start real Postgres, RabbitMQ, and MinIO per run. First targets:
+  - repository code against real Postgres (migrations applied)
+  - publish/consume round-trip against real RabbitMQ
+  - upload → store → queue → worker-process flow with a generated fixture MP4
+    (`ffmpeg -f lavfi -i testsrc ...` — never commit media files)
+- Local entry point mirrors CI: `go test -tags integration ./...` per app.
+- Dependency caching (Go modules, npm) to keep runs fast.
+
+### Done when
+
+- CI is green on the main branch and required for PRs.
+- An integration test exercises the full upload→ready flow against real
+  dependencies in CI.
+- A deliberately introduced dual-write bug (the M5 target) is the kind of thing
+  the harness *could* catch — the suite touches real Postgres and RabbitMQ.
+
+## Milestone 5: Correctness Under Failure
 
 The pipeline must survive any single component dying at any moment, with every
 video eventually `ready` or `failed` — never stuck.
 
-### 4.1 Transactional outbox
+### 5.1 Transactional outbox
 
 - New `outbox_messages` table. `Upload` writes video + job + outbox row in one
   DB transaction and never talks to RabbitMQ directly.
@@ -181,7 +230,7 @@ CREATE TABLE outbox_messages (
 CREATE INDEX idx_outbox_unpublished ON outbox_messages(created_at) WHERE published_at IS NULL;
 ```
 
-### 4.2 Leases, heartbeats, reaper
+### 5.2 Leases, heartbeats, reaper
 
 - `video_jobs` gains `claimed_by TEXT` and `lease_expires_at TIMESTAMPTZ`.
 - Claiming a job sets both (lease ~2 minutes) and increments `attempts`.
@@ -190,7 +239,7 @@ CREATE INDEX idx_outbox_unpublished ON outbox_messages(created_at) WHERE publish
   leases: below max attempts → reset to `queued` and re-enqueue via the outbox;
   at max attempts → mark job and video `failed`.
 
-### 4.3 Retries, backoff, DLQ
+### 5.3 Retries, backoff, DLQ
 
 - Max 3 attempts per job.
 - Transient failure below max attempts → publish to `video.transcode.retry`
@@ -200,7 +249,7 @@ CREATE INDEX idx_outbox_unpublished ON outbox_messages(created_at) WHERE publish
 - Distinguish permanent failures (corrupt input, no video stream) and skip
   retries for them.
 
-### 4.4 Idempotency and clean shutdown
+### 5.4 Idempotency and clean shutdown
 
 - Upload accepts an `Idempotency-Key` header; replays return the original
   response instead of creating a duplicate video.
@@ -217,8 +266,9 @@ CREATE INDEX idx_outbox_unpublished ON outbox_messages(created_at) WHERE publish
   drains after RabbitMQ returns.
 - A poison message lands in the DLQ without wedging the consumer.
 - Every status transition is visible in `video_events`.
+- Integration tests cover outbox relay, lease expiry, and retry routing.
 
-## Milestone 5: Scalable Ingest
+## Milestone 6: Scalable Ingest
 
 The API becomes a control plane; video bytes flow directly between the browser
 and object storage via presigned multipart uploads, resumable across reloads.
@@ -239,14 +289,14 @@ DELETE /uploads/:id                  # abort multipart
 ```
 
 - Completion validates declared size and part checksums (ETags), then creates
-  video + job + outbox row in one transaction — reusing the M4 machinery.
+  video + job + outbox row in one transaction — reusing the M5 machinery.
 - A cleanup loop aborts expired sessions and their MinIO multipart uploads.
 - Size limits enforced at session creation (declared) and completion (actual).
 - Web uploader: slice the file, upload parts with bounded concurrency, retry
   individual parts, persist the session id so a page reload resumes from
   `GET /uploads/:id`, show real progress.
 - The legacy proxy endpoint `POST /videos/upload` is removed (or kept briefly
-  behind a flag for comparison benchmarks in M9).
+  behind a flag for comparison benchmarks in M10).
 
 ### Done when
 
@@ -254,7 +304,7 @@ DELETE /uploads/:id                  # abort multipart
 - Killing the tab mid-upload and reloading resumes from the completed parts.
 - A tampered part (checksum mismatch) fails completion cleanly.
 
-## Milestone 6: Distributed Transcoding
+## Milestone 7: Distributed Transcoding
 
 Replace the monolithic transcode job with a fan-out/aggregate pipeline so N
 workers share one video's work — the map-reduce shape real video platforms use.
@@ -268,7 +318,7 @@ workers share one video's work — the map-reduce shape real video platforms use
   fans out messages to `video.rendition` via the outbox.
 - **Rendition workers** consume `video.rendition`: each transcodes exactly one
   quality (per-variant playlist + segments) and uploads it. Leases, heartbeats,
-  retries from M4 apply per rendition — one quality failing and retrying does
+  retries from M5 apply per rendition — one quality failing and retrying does
   not redo the others.
 - **Aggregation**: completion of each rendition atomically decrements a pending
   counter (`UPDATE ... RETURNING` in Postgres). Whoever completes the last
@@ -290,12 +340,13 @@ workers share one video's work — the map-reduce shape real video platforms use
   race is tested).
 - A rendition failure mid-fan-out converges to `failed`, never to a stuck state.
 
-## Milestone 7: Serving At Scale
+## Milestone 8: Serving At Scale
 
 Answer the playback question properly: no anonymous buckets, short-lived signed
-URLs for every object, and a caching tier in front of storage.
+URLs for every object, a caching tier in front of storage — and replace status
+polling with real-time push.
 
-### Design
+### Design — signed playback behind an edge cache
 
 - Remove `mc anonymous set download` from the MinIO setup; all buckets private.
 - **Manifest rewriting**: the API serves playlists and signs segment URLs:
@@ -311,11 +362,22 @@ GET /videos/:id/hls/:quality/index.m3u8    # segment URIs point at nginx, HMAC-s
   with `secure_link`, proxies misses to MinIO, caches segments aggressively
   (immutable, long TTL) and playlists briefly. This is where cache hit ratio,
   keys, and invalidation get real.
-- **Redis finally earns its keep**: cache rewritten manifests (TTL shorter than
-  token expiry), token-bucket rate limiting on playback endpoints, view
-  counters via `INCR` flushed periodically to Postgres.
+- **Redis**: cache rewritten manifests (TTL shorter than token expiry),
+  token-bucket rate limiting on playback endpoints, view counters via `INCR`
+  flushed periodically to Postgres.
 - The web player switches to the manifest endpoint; quality selection keeps
   working because variant playlists still flow through hls.js.
+
+### Design — real-time status over SSE
+
+- Workers publish status transitions to a Redis pub/sub channel (in addition
+  to the DB write, which remains the source of truth).
+- The API exposes `GET /videos/:id/events` as a Server-Sent Events stream:
+  subscribes to Redis, forwards transitions, supports `Last-Event-ID` by
+  replaying missed transitions from `video_events` on reconnect.
+- The web status page consumes SSE and falls back to polling if the stream
+  errors. This exercises connection lifecycle, fan-out to many subscribers,
+  and recovery when the API restarts mid-stream.
 
 ### Done when
 
@@ -323,8 +385,10 @@ GET /videos/:id/hls/:quality/index.m3u8    # segment URIs point at nginx, HMAC-s
   401s after.
 - Repeat playback of the same video shows nginx cache hits, not MinIO reads.
 - A rate-limited client gets 429s while others stream unaffected.
+- The status page updates with no polling; restarting the API mid-stream
+  reconnects and replays missed events.
 
-## Milestone 8: Observability
+## Milestone 9: Observability
 
 One trace from upload to `ready`, metrics for every stage, dashboards that make
 queue lag and failure visible at a glance.
@@ -338,7 +402,8 @@ queue lag and failure visible at a glance.
   upload, finalize.
 - Prometheus metrics: HTTP latency/RPS/error rate (API); job duration per
   stage and per rendition, success/failure/retry counters (worker); queue depth
-  and consumer counts (RabbitMQ prometheus plugin); cache hit ratio (nginx).
+  and consumer counts (RabbitMQ prometheus plugin); cache hit ratio (nginx);
+  SSE subscriber count.
 - Docker Compose grows `jaeger`, `prometheus`, `grafana` services with
   provisioned dashboards: pipeline health (queue depth, in-flight jobs, time-
   to-ready p50/p95, failure rate) and API health.
@@ -353,7 +418,7 @@ queue lag and failure visible at a glance.
 - The Grafana pipeline dashboard makes a killed worker or a queue backlog
   visible without reading logs.
 
-## Milestone 9: Proof — SLOs, Load, Chaos
+## Milestone 10: Proof — SLOs, Load, Chaos, DR
 
 "Hardcore" means demonstrated, not claimed. State objectives, push the system
 until they break, break the system on purpose, and write down what happened.
@@ -376,41 +441,150 @@ until they break, break the system on purpose, and write down what happened.
   3. MinIO unavailable during transcode
   4. `WORK_DIR` disk full
   5. Postgres restart under load
+- **Disaster recovery drill**: Postgres WAL archiving with point-in-time
+  recovery; a scripted "restore the database to 5 minutes ago" drill, run for
+  real, with its own postmortem. Backup stories are claimed everywhere and
+  tested almost nowhere — test it.
 - **E2E smoke script** that runs the full upload → ready → playback path
   against a fresh compose stack.
 - **Docs**: architecture diagram of the final system and short ADRs in
   `docs/adr/` for the major decisions (outbox, leases, fan-out, manifest
-  signing).
+  signing, SSE).
 
 ### Done when
 
 - Every chaos scenario converges with zero stuck videos and has a postmortem.
+- The PITR restore drill has been run successfully and documented.
 - Load test results vs SLOs are committed.
 - A newcomer can understand the system from the diagram and ADRs alone.
 
 ---
 
+## Milestone 11: Analytics and Player Intelligence (Phase 3)
+
+The classic write-heavy design problem, plus the player features that make the
+product feel real.
+
+### Design — watch-time pipeline
+
+- The player emits heartbeat events every ~10s while playing (video id,
+  session id, position, selected quality, buffering state), with
+  `navigator.sendBeacon` on page unload.
+- `POST /analytics/events` accepts small batches, validates, and appends to a
+  Redis Stream — the ingest path does no aggregation and stays fast.
+- An aggregator service (or goroutine) consumes the stream via a consumer
+  group and maintains:
+  - total watch time per video (flushed to Postgres)
+  - audience retention curve (watch counts per 10s bucket of the video)
+  - concurrent viewers per video (gauge with TTL)
+  - unique views via Redis HyperLogLog (`PFADD`/`PFCOUNT`)
+- New analytics tables (migration), and a per-video analytics dashboard page
+  in the web app: watch time, retention curve chart, live concurrent viewers.
+- This is the place to discuss (in the ADR) why the ingest path is a stream
+  and not direct DB writes, delivery semantics, and what Kafka would change.
+
+### Design — storyboards (seek preview)
+
+- During transcode, the worker also generates a storyboard: a sprite sheet of
+  small frames (e.g. one per 2s) plus a WebVTT file mapping time ranges to
+  sprite coordinates, uploaded under `processed-videos/{videoId}/storyboard/`.
+- The player shows the frame preview when hovering/scrubbing the seek bar —
+  the YouTube interaction, built from your own pipeline.
+
+### Done when
+
+- Watching a video produces a retention curve and watch-time numbers that
+  survive an aggregator restart (consumer group resumes, no double counting
+  beyond at-least-once tolerance).
+- Concurrent-viewer count is live during playback and decays when tabs close.
+- Scrubbing the seek bar shows frame previews.
+
+## Milestone 12: Auth, Quotas, and Fair Scheduling (Phase 3)
+
+Multi-tenancy turns every earlier system into a harder version of itself.
+
+### Design
+
+- Activate the dormant `users` table: register/login with hashed passwords
+  (bcrypt/argon2), JWT access tokens, ownership column enforced on uploads and
+  mutating endpoints. Public playback stays public; "my videos" is scoped.
+- **Quotas**: per-user total storage bytes and uploads/day, enforced at upload
+  session creation (declared size) and completion (actual size).
+- **Rate limiting**: per-user token buckets in Redis on the API surface
+  (extending the M8 per-IP playback limiter).
+- **Fair scheduling** — the hardcore part: one user uploading 50 videos must
+  not starve everyone else. Replace naive FIFO dispatch with per-tenant
+  queues and a round-robin (optionally weighted) dispatcher that feeds
+  `video.transcode`, so each active tenant gets a fair share of worker
+  capacity. Document the alternatives considered (RabbitMQ priorities,
+  multiple queues, dispatcher service) in an ADR.
+- Web: register/login UI, session handling, "my videos" page, quota usage
+  display.
+
+### Done when
+
+- A drill proves fairness: tenant A enqueues 50 videos, tenant B enqueues 1,
+  and B's video completes in roughly single-tenant time, not behind all 50.
+- Quota and rate-limit violations fail with clear, tested error responses.
+- All mutating endpoints require auth; ownership is enforced and tested.
+
+---
+
+## Phase 4: Capstone Options
+
+Commit to these only after M10 proves the foundation. Each is a project-sized
+effort; pick by interest.
+
+- **Live streaming** — RTMP ingest (OBS → nginx-rtmp or MediaMTX), near-real-
+  time HLS packaging, live-to-VOD archiving through the existing pipeline.
+  The most iconic capstone; touches latency budgets, sliding-window playlists,
+  and stream key auth.
+- **Kubernetes + real cloud** — kind/k3s locally with Helm charts, KEDA
+  autoscaling workers on queue depth (the production version of the M7
+  experiment), then Terraform to real S3 + CloudFront. Turns "ran locally"
+  into "deployed".
+
+## Optional Extensions (pick by interest, any time after M10)
+
+- **Subtitles via Whisper** — a transcription job type through the same
+  pipeline (proves the job system is general); HLS native subtitle tracks.
+- **HLS AES-128 encryption** — segment encryption with an auth-gated key
+  endpoint (`EXT-X-KEY`); natural extension of M8's signing work.
+
+Deliberately out of scope: recommendations/ML, microservice splitting for its
+own sake, GraphQL, comments/likes (CRUD, not system design).
+
+---
+
 ## Build Order
 
-Strictly in milestone order — correctness before scale, scale before polish:
+Strictly in milestone order — CI first, correctness before scale, scale before
+polish, proof before product features:
 
-1. M4: outbox → leases/reaper → retries/DLQ → idempotency → shutdown → chaos checks.
-2. M5: sessions table → API endpoints → web uploader → remove proxy path.
-3. M6: job hierarchy → planner → rendition workers → aggregation → multi-worker runs.
-4. M7: private buckets → manifest endpoints → signing → nginx → Redis.
-5. M8: tracing → metrics → compose services → dashboards.
-6. M9: SLOs → load tests → chaos suite → postmortems → final docs.
+1. M4: GitHub Actions → testcontainers harness → integration upload-flow test.
+2. M5: outbox → leases/reaper → retries/DLQ → idempotency → shutdown → failure drills.
+3. M6: sessions table → API endpoints → web uploader → remove proxy path.
+4. M7: job hierarchy → planner → rendition workers → aggregation → multi-worker runs.
+5. M8: private buckets → manifest endpoints → signing → nginx → Redis → SSE.
+6. M9: tracing → metrics → compose services → dashboards.
+7. M10: SLOs → load tests → chaos suite → DR drill → postmortems → final docs.
+8. M11: heartbeat ingest → stream aggregator → analytics UI → storyboards.
+9. M12: auth → quotas → rate limits → fair scheduling drill.
 
-Each milestone lands with tests, a `PROGRESS.md` update, and migrations under
-`infrastructure/migrations/` (numbered `000002_...` onward).
+Each milestone lands with tests, a `PROGRESS.md` update, an ADR when it makes
+an architectural decision, and migrations under `infrastructure/migrations/`
+(numbered `000002_...` onward). Write the milestone's docs/ADR while building
+it, not after — the writeups are half the portfolio value.
 
 ## New Environment Variables (introduced per milestone)
 
 ```txt
-M4: OUTBOX_POLL_INTERVAL, JOB_LEASE_SECONDS, JOB_MAX_ATTEMPTS, WORKER_ID
-M5: UPLOAD_SESSION_TTL, UPLOAD_PART_SIZE
-M7: PLAYBACK_HMAC_SECRET, EDGE_BASE_URL, REDIS_ADDR (finally used)
-M8: OTEL_EXPORTER_OTLP_ENDPOINT, METRICS_ADDR
+M5:  OUTBOX_POLL_INTERVAL, JOB_LEASE_SECONDS, JOB_MAX_ATTEMPTS, WORKER_ID
+M6:  UPLOAD_SESSION_TTL, UPLOAD_PART_SIZE
+M8:  PLAYBACK_HMAC_SECRET, EDGE_BASE_URL, REDIS_ADDR (finally used)
+M9:  OTEL_EXPORTER_OTLP_ENDPOINT, METRICS_ADDR
+M11: ANALYTICS_STREAM_NAME, ANALYTICS_FLUSH_INTERVAL
+M12: JWT_SECRET, ACCESS_TOKEN_TTL
 ```
 
 Keep `.env.example` files current when these land.
@@ -422,19 +596,24 @@ Keep `.env.example` files current when these land.
 - No video may ever be stuck: every state must have a path to `ready` or `failed` driven by a timeout, retry, or reaper.
 - All DB-then-publish sequences go through the outbox; never dual-write.
 - Deterministic object keys so retries overwrite rather than duplicate.
+- The DB is the source of truth; Redis pub/sub, streams, and caches are derived and rebuildable.
 - Each milestone is proven by a failure drill or measurement, not just tests passing.
+- CI must stay green; integration tests run against real dependencies, not fakes.
 - Keep contracts (queue payloads, object key layout, API JSON) in sync across `apps/api`, `apps/worker`, and `apps/web/lib/api.ts`.
 
 ## Resolved Decisions
 
+- CI: GitHub Actions with testcontainers-go integration tests against real Postgres/RabbitMQ/MinIO.
 - Playback strategy: API manifest rewriting + HMAC-signed segment URLs behind an nginx edge cache (was an open question).
+- Realtime status: SSE backed by Redis pub/sub, with `video_events` replay on reconnect; polling remains the fallback.
+- Analytics ingest: Redis Streams with consumer groups (Kafka documented as the scale-up path, not adopted locally).
 - SQL access: stay on `database/sql` + pgx; no ORM.
 - Publish strategy: transactional outbox, at-least-once delivery.
 - Retry transport: RabbitMQ TTL retry queue + dead-letter exchange.
 
 ## Open Decisions
 
-- Segment-level parallel transcoding (M6 stretch): worth the stitching complexity locally, or document the design and skip?
-- CMAF/fMP4 segments instead of MPEG-TS: revisit if/when LL-HLS becomes interesting.
-- Kubernetes deployment with KEDA autoscaling: only after M9; local compose autoscaling experiment comes first.
-- Auth/multi-tenancy: deliberately out of scope for Phase 2; the `users` table stays dormant.
+- Segment-level parallel transcoding (M7 stretch): worth the stitching complexity locally, or document the design and skip?
+- CMAF/fMP4 segments instead of MPEG-TS: revisit if/when LL-HLS or the live-streaming capstone becomes interesting.
+- Phase 4 pick: live streaming vs Kubernetes/cloud first (or both, in which order).
+- Fair-scheduling mechanism detail (M12): dispatcher service vs RabbitMQ priority queues — decide with an ADR when starting M12.

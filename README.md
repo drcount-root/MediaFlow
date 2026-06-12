@@ -126,4 +126,4 @@ npm run build
 
 ## Current Status
 
-Phase 1 (Milestones 0–3, the MVP pipeline) is complete. Phase 2 turns MediaFlow into a hardcore distributed-systems project — Milestones 4–9 cover failure correctness (outbox, leases, retries, DLQ), presigned multipart uploads, distributed fan-out transcoding, signed manifests behind an edge cache, observability, and load/chaos testing. The next focus is Milestone 4: Correctness Under Failure.
+Phase 1 (Milestones 0–3, the MVP pipeline) is complete. Phase 2 turns MediaFlow into a hardcore distributed-systems project — Milestones 4–10 cover CI with real-dependency integration tests, failure correctness (outbox, leases, retries, DLQ), presigned multipart uploads, distributed fan-out transcoding, signed manifests behind an edge cache with SSE status push, observability, and load/chaos/disaster-recovery drills. Phase 3 (Milestones 11–12) adds a watch-time analytics pipeline, storyboard seek previews, auth, quotas, and fair scheduling. The next focus is Milestone 4: CI and Integration Test Harness.

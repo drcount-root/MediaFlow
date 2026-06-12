@@ -4,15 +4,15 @@ Last updated: 2026-06-12
 
 ## Overall Status
 
-Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (hardcore system design, Milestones 4–9) not started.
+Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) not started. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
 
 Current focus:
 
 ```txt
-Milestone 4: Correctness Under Failure
+Milestone 4: CI and Integration Test Harness
 ```
 
-See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
+See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 
 ## Milestones
 
@@ -22,12 +22,16 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 | 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
-| 4. Correctness Under Failure | Not started | Transactional outbox, job leases + reaper, retries/backoff/DLQ, idempotency, graceful shutdown. |
-| 5. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
-| 6. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
-| 7. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis caching/rate limiting/counters. |
-| 8. Observability | Not started | OpenTelemetry traces across the queue, Prometheus metrics, Jaeger + Grafana dashboards. |
-| 9. Proof: SLOs, Load, Chaos | Not started | Stated SLOs, k6 load tests, scripted chaos scenarios with postmortems, ADRs. |
+| 4. CI and Integration Test Harness | Not started | GitHub Actions; testcontainers-go integration tests against real Postgres/RabbitMQ/MinIO. |
+| 5. Correctness Under Failure | Not started | Transactional outbox, job leases + reaper, retries/backoff/DLQ, idempotency, graceful shutdown. |
+| 6. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
+| 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
+| 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
+| 9. Observability | Not started | OpenTelemetry traces across the queue, Prometheus metrics, Jaeger + Grafana dashboards. |
+| 10. Proof: SLOs, Load, Chaos, DR | Not started | Stated SLOs, k6 load tests, scripted chaos scenarios, PITR restore drill, postmortems, ADRs. |
+| 11. Analytics and Player Intelligence | Not started | Watch-time heartbeat pipeline via Redis Streams, retention curves, HLL unique views, storyboard seek previews. |
+| 12. Auth, Quotas, Fair Scheduling | Not started | JWT auth, per-user quotas and rate limits, per-tenant fair dispatch. |
+| Phase 4 Capstone | Not started | Live streaming and/or Kubernetes + cloud — pick after Milestone 10. |
 
 ## Detailed Checklist
 
@@ -106,7 +110,21 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [x] Show playback errors clearly
 - [x] Add frontend tests or smoke checks
 
-### Milestone 4: Correctness Under Failure
+### Milestone 4: CI and Integration Test Harness
+
+- [ ] GitHub Actions workflow: API `gofmt` check, `go vet`, `go test ./...`
+- [ ] GitHub Actions workflow: worker tests with ffmpeg/ffprobe installed in runner
+- [ ] GitHub Actions workflow: web `npm run lint` and `npm run build`
+- [ ] Go module and npm dependency caching in CI
+- [ ] Integration test suite behind `integration` build tag using testcontainers-go
+- [ ] Integration: repository tests against real Postgres with migrations applied
+- [ ] Integration: publish/consume round-trip against real RabbitMQ
+- [ ] Integration: upload → store → queue → process flow with generated fixture MP4
+- [ ] Fixture MP4 generated via ffmpeg in tests (never committed)
+- [ ] Local command mirrors CI (`go test -tags integration ./...`)
+- [ ] CI required for PRs; main branch green
+
+### Milestone 5: Correctness Under Failure
 
 - [ ] Add migration `000002`: `outbox_messages` table
 - [ ] Add migration `000002`: `video_jobs.claimed_by` and `video_jobs.lease_expires_at`
@@ -124,12 +142,12 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [ ] Make worker retries overwrite-safe (clear stale variants, deterministic keys)
 - [ ] Add graceful worker shutdown (finish in-flight job on SIGTERM)
 - [ ] Write `video_events` row on every status transition
-- [ ] Tests: outbox relay, claim/lease, retry routing, reaper, idempotency key
+- [ ] Tests (incl. integration): outbox relay, claim/lease, retry routing, reaper, idempotency key
 - [ ] Failure drill: `kill -9` worker mid-job → reaper recovers → video `ready`
 - [ ] Failure drill: RabbitMQ down during upload → outbox drains after restart
 - [ ] Failure drill: poison message lands in DLQ without wedging the consumer
 
-### Milestone 5: Scalable Ingest
+### Milestone 6: Scalable Ingest
 
 - [ ] Add migration `000003`: `upload_sessions` table
 - [ ] `POST /uploads`: create session, initiate MinIO multipart upload
@@ -146,13 +164,13 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [ ] Tests: session lifecycle, resume, checksum mismatch, oversize rejection
 - [ ] Verify: 500MB upload never transits the API process
 
-### Milestone 6: Distributed Transcoding
+### Milestone 7: Distributed Transcoding
 
 - [ ] Add migration `000004`: `video_jobs.parent_job_id`, job types `plan | rendition | finalize`, pending-rendition tracking
 - [ ] Split worker into planner and rendition consumers
 - [ ] Planner: probe, thumbnail, plan renditions, fan out `video.rendition` jobs via outbox
 - [ ] Rendition worker: transcode exactly one quality, upload its playlist and segments
-- [ ] Apply M4 leases/retries per rendition (one rendition retries without redoing others)
+- [ ] Apply M5 leases/retries per rendition (one rendition retries without redoing others)
 - [ ] Atomic completion counter (`UPDATE ... RETURNING`); last rendition triggers finalize
 - [ ] Finalizer: write `master.m3u8`, insert `video_variants`, mark video `ready`
 - [ ] Partial failure: exhausted rendition fails the video and cleans up
@@ -162,7 +180,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [ ] Tests: fan-out, aggregation race (two renditions finish simultaneously), partial failure
 - [ ] Stretch: segment-level parallel transcode and playlist stitching
 
-### Milestone 7: Serving At Scale
+### Milestone 8: Serving At Scale
 
 - [ ] Remove anonymous download policy from processed/thumbnail buckets
 - [ ] `GET /videos/:id/hls/master.m3u8`: rewrite variant URIs to API endpoints
@@ -174,11 +192,15 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [ ] Redis: token-bucket rate limiting on playback endpoints
 - [ ] Redis: view counters with periodic flush to Postgres
 - [ ] Web player switches to the manifest endpoint (quality selection still works)
+- [ ] Workers publish status transitions to Redis pub/sub
+- [ ] SSE endpoint `GET /videos/:id/events` with `Last-Event-ID` replay from `video_events`
+- [ ] Web status page consumes SSE with polling fallback
 - [ ] Verify: anonymous segment fetch fails; expired signature returns 401/403
 - [ ] Verify: repeat playback hits nginx cache, not MinIO
-- [ ] Tests: signing, expiry, manifest rewriting, rate limiting
+- [ ] Verify: API restart mid-stream → SSE reconnects and replays missed events
+- [ ] Tests: signing, expiry, manifest rewriting, rate limiting, SSE replay
 
-### Milestone 8: Observability
+### Milestone 9: Observability
 
 - [ ] OpenTelemetry tracing middleware in the API
 - [ ] Inject trace context into AMQP headers in the outbox relay
@@ -188,14 +210,14 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [ ] Prometheus metrics in API (latency, RPS, error rate)
 - [ ] Prometheus metrics in worker (stage durations, success/failure/retry counters)
 - [ ] Enable RabbitMQ prometheus plugin (queue depth, consumers)
-- [ ] nginx cache hit ratio metrics
+- [ ] nginx cache hit ratio metrics; SSE subscriber gauge
 - [ ] Add Prometheus and Grafana to Docker Compose with provisioned dashboards
 - [ ] Pipeline health dashboard (queue depth, in-flight jobs, time-to-ready p50/p95, failure rate)
 - [ ] Structured `slog` logging with trace/correlation IDs in both Go apps
 - [ ] Store trace id in `video_events.metadata_json`
 - [ ] Draft alert rules: queue lag, error rate, jobs stuck in `processing`
 
-### Milestone 9: Proof — SLOs, Load, Chaos
+### Milestone 10: Proof — SLOs, Load, Chaos, DR
 
 - [ ] Write `docs/SLOS.md` with stated, measurable objectives
 - [ ] k6 upload load test (`tests/load/`)
@@ -206,11 +228,49 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - [ ] Chaos: MinIO unavailable during transcode + postmortem
 - [ ] Chaos: `WORK_DIR` disk full + postmortem
 - [ ] Chaos: Postgres restart under load + postmortem
+- [ ] DR: Postgres WAL archiving configured
+- [ ] DR: scripted point-in-time-recovery restore drill, run for real + postmortem
 - [ ] E2E smoke script: fresh compose stack → upload → ready → playback
 - [ ] Architecture diagram of the final system
-- [ ] ADRs in `docs/adr/` (outbox, leases, fan-out, manifest signing)
+- [ ] ADRs in `docs/adr/` (outbox, leases, fan-out, manifest signing, SSE)
 - [ ] Record load test results against SLOs
 - [ ] Final README and docs update
+
+### Milestone 11: Analytics and Player Intelligence
+
+- [ ] Add migration `000005`: analytics tables (watch time aggregates, retention buckets)
+- [ ] Player heartbeat emitter (~10s interval; position, quality, buffering; `sendBeacon` on unload)
+- [ ] `POST /analytics/events`: batched, validated ingest appending to a Redis Stream
+- [ ] Aggregator consuming the stream via consumer group
+- [ ] Total watch time per video, flushed to Postgres
+- [ ] Audience retention curve (per 10s bucket of the video)
+- [ ] Concurrent viewers gauge with TTL decay
+- [ ] Unique views via Redis HyperLogLog
+- [ ] Per-video analytics dashboard page in the web app (watch time, retention chart, live viewers)
+- [ ] Worker generates storyboard sprite sheet + WebVTT during transcode
+- [ ] Player seek-bar hover shows frame previews
+- [ ] Verify: aggregator restart resumes the consumer group without gross double counting
+- [ ] ADR: why a stream for ingest; delivery semantics; the Kafka scale-up path
+- [ ] Tests: ingest validation, aggregation, retention bucketing
+
+### Milestone 12: Auth, Quotas, Fair Scheduling
+
+- [ ] Add migration `000006`: password hash on `users`, ownership enforcement, quota tracking
+- [ ] Register/login endpoints with bcrypt/argon2 and JWT access tokens
+- [ ] Ownership enforced on uploads and all mutating endpoints
+- [ ] Per-user quotas: total storage bytes and uploads/day (checked at session create and complete)
+- [ ] Per-user token-bucket rate limiting in Redis
+- [ ] Per-tenant fair dispatch feeding `video.transcode` (round-robin or weighted)
+- [ ] ADR: fair-scheduling mechanism chosen and alternatives considered
+- [ ] Web: register/login UI and session handling
+- [ ] Web: "my videos" page and quota usage display
+- [ ] Fairness drill: tenant A enqueues 50 videos, tenant B enqueues 1; B completes in ~single-tenant time
+- [ ] Tests: authz, quota enforcement, rate limits, dispatcher fairness
+
+### Phase 4 Capstone (pick after Milestone 10)
+
+- [ ] Decide: live streaming vs Kubernetes/cloud first (ADR)
+- [ ] Scope the chosen capstone into its own milestone plan in `MEDIAFLOW_PLAN.md`
 
 ## Current Decisions
 
@@ -223,19 +283,23 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 | First DB | PostgreSQL |
 | First backend language | Go |
 | First frontend framework | Next.js |
+| CI | GitHub Actions + testcontainers-go integration tests against real dependencies |
 | Publish strategy | Transactional outbox, at-least-once delivery |
 | Stuck-job recovery | Leases with heartbeats + reaper |
 | Retry strategy | TTL retry queue + DLX, max 3 attempts, then DLQ |
-| Upload path (Phase 2) | Presigned multipart direct-to-MinIO; API is control plane only |
-| Transcode topology (Phase 2) | Planner fan-out of per-rendition jobs + atomic aggregation |
-| Playback (Phase 2) | API manifest rewriting + HMAC-signed segment URLs behind nginx edge cache |
+| Upload path (M6) | Presigned multipart direct-to-MinIO; API is control plane only |
+| Transcode topology (M7) | Planner fan-out of per-rendition jobs + atomic aggregation |
+| Playback (M8) | API manifest rewriting + HMAC-signed segment URLs behind nginx edge cache |
+| Realtime status (M8) | SSE over Redis pub/sub with `video_events` replay; polling fallback |
+| Analytics ingest (M11) | Redis Streams + consumer groups; Kafka documented as scale-up path |
 | SQL access | `database/sql` + pgx, no ORM |
 
 ## Open Questions
 
-- Segment-level parallel transcoding (M6 stretch): implement locally or document the design and skip?
-- CMAF/fMP4 segments instead of MPEG-TS: revisit if LL-HLS becomes interesting.
-- Kubernetes + KEDA deployment: only after M9; the compose autoscaling experiment comes first.
+- Segment-level parallel transcoding (M7 stretch): implement locally or document the design and skip?
+- CMAF/fMP4 segments instead of MPEG-TS: revisit for LL-HLS or the live-streaming capstone.
+- Phase 4 pick: live streaming vs Kubernetes/cloud first.
+- Fair-scheduling mechanism detail (M12): dispatcher service vs RabbitMQ priority queues — decide with an ADR.
 
 ## Update Rules
 
@@ -243,3 +307,4 @@ See `MEDIAFLOW_PLAN.md` for the design behind each Phase 2 milestone.
 - Keep statuses simple: `Not started`, `In progress`, `Blocked`, `Done`.
 - Add short notes when a task changes architecture, schema, queue contracts, or environment variables.
 - Do not mark a milestone `Done` until its checklist is complete and its failure drills / verification steps have actually been run.
+- Write each milestone's ADR and docs while building it, not after.

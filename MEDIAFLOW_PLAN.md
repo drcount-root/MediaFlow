@@ -2,1100 +2,439 @@
 
 ## Goal
 
-Build a portfolio-grade YouTube-like VOD platform that supports video uploads, asynchronous processing, FFmpeg transcoding, HLS adaptive streaming, thumbnail generation, and playback through a web UI.
+Build a hardcore, portfolio-grade distributed video platform in two phases.
 
-The first milestone is intentionally narrow:
+Phase 1 (complete) was the narrow MVP pipeline:
 
 ```txt
 Upload MP4 -> Queue Job -> FFmpeg creates HLS -> hls.js plays adaptive stream
 ```
 
+Phase 2 (current) turns MediaFlow into a serious system design project. Each milestone takes a real weakness that exists in the Phase 1 code today, fixes it with a canonical distributed-systems pattern, and then proves the fix under failure and load. The point is not more features; it is correctness, scalability, observability, and evidence.
+
+```txt
+M4 Correctness under failure   -> outbox, leases, retries, DLQ, idempotency
+M5 Scalable ingest             -> presigned multipart direct-to-storage uploads
+M6 Distributed transcoding     -> fan-out renditions, aggregation, parallel workers
+M7 Serving at scale            -> signed manifests, edge cache, Redis
+M8 Observability               -> traces across the queue, metrics, dashboards
+M9 Proof                       -> SLOs, load tests, chaos experiments, postmortems
+```
+
 ## Core Architecture
+
+Current (Phase 1):
 
 ```txt
 Frontend
-  -> Upload API
-  -> Object Storage: raw video
-  -> Queue: video processing job
-  -> Worker: FFmpeg transcode + thumbnails
-  -> Object Storage: HLS output
+  -> Upload API (proxies whole file)
+  -> MinIO: raw video
+  -> RabbitMQ: video.transcode
+  -> Worker: FFmpeg transcode + thumbnail (whole video, one worker)
+  -> MinIO: HLS output
   -> DB status update
-  -> Frontend player loads master.m3u8
+  -> Frontend player loads presigned master.m3u8
 ```
 
-## Recommended Stack
+Target (Phase 2):
+
+```txt
+Frontend
+  -> Upload API: creates upload session, issues presigned multipart URLs
+  -> Browser uploads parts directly to MinIO
+  -> API completes session: video + job + outbox row in one DB transaction
+  -> Outbox relay publishes to RabbitMQ (at-least-once, publisher confirms)
+  -> Planner worker: probe + thumbnail + fan out per-rendition jobs
+  -> N rendition workers transcode in parallel (leases, heartbeats, retries)
+  -> Finalizer assembles master manifest when the last rendition completes
+  -> Playback: API rewrites manifests with HMAC-signed segment URLs
+  -> nginx edge cache (CDN stand-in) serves segments, validates signatures
+  -> Redis: manifest cache, rate limiting, view counters
+  -> OpenTelemetry trace spans the whole pipeline; Prometheus + Grafana watch it
+```
+
+## Stack
 
 | Area | Choice |
 | --- | --- |
 | Frontend | Next.js, hls.js |
 | Backend API | Go + Gin |
-| Queue | RabbitMQ |
-| Database | PostgreSQL |
-| Cache/status | Redis |
-| Local object storage | MinIO |
-| Cloud object storage later | AWS S3 |
+| Queue | RabbitMQ (TTL retry queues + DLX) |
+| Database | PostgreSQL (`database/sql` + pgx) |
+| Cache / counters / rate limiting | Redis |
+| Object storage | MinIO locally, S3-compatible later |
 | Video processing | FFmpeg |
+| Edge cache (CDN stand-in) | nginx (`proxy_cache` + `secure_link`) |
+| Tracing | OpenTelemetry + Jaeger |
+| Metrics | Prometheus + Grafana |
+| Load testing | k6 |
 | Local infrastructure | Docker Compose |
-| Production infrastructure later | Kubernetes, CDN |
+| Production later | Kubernetes, real CDN |
 
-## Local Development Assumptions
+## Phase 1 Record (Shipped)
 
-These assumptions keep the first implementation practical:
+Milestones 0–3 are complete; the code is the source of truth. The contracts below
+are what Phase 2 builds on and must not be broken accidentally.
 
-- The first version is local-only.
-- One developer runs all services through Docker Compose plus local app commands.
-- Authentication is skipped initially. Use a nullable `user_id` or a seeded demo user.
-- Uploaded files are accepted through the API server first. Direct browser-to-MinIO uploads are a later optimization.
-- Max upload size can start at `500MB` locally, then be made configurable.
-- Supported upload format for MVP: `video/mp4`.
-- Output protocol for MVP: HLS only.
-- Output container for HLS segments: MPEG-TS initially, CMAF/fMP4 later if needed.
-- Playback URLs can be presigned MinIO URLs or proxied API URLs. Prefer presigned URLs for simpler streaming.
-- The first worker can process one video at a time. Parallel worker scaling comes later.
-
-## Environment Variables
-
-Use explicit env vars per app so Docker/local runs are predictable.
-
-### API
+### Video lifecycle
 
 ```txt
-APP_ENV=local
-HTTP_ADDR=:8080
-DATABASE_URL=postgres://mediaflow:mediaflow@localhost:55432/mediaflow?sslmode=disable
-RABBITMQ_URL=amqp://mediaflow:mediaflow@localhost:5672/
-REDIS_ADDR=localhost:6379
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=mediaflow
-MINIO_SECRET_KEY=mediaflow-secret
-MINIO_USE_SSL=false
-MINIO_RAW_BUCKET=mediaflow-raw
-MINIO_PROCESSED_BUCKET=mediaflow-processed
-MINIO_THUMBNAIL_BUCKET=mediaflow-thumbnails
-MAX_UPLOAD_BYTES=524288000
+uploading -> uploaded -> queued -> processing -> ready
+any non-terminal state -> failed (error_message explains why)
 ```
 
-### Worker
+Each meaningful transition should write a `video_events` row.
+
+### API surface
 
 ```txt
-APP_ENV=local
-DATABASE_URL=postgres://mediaflow:mediaflow@localhost:55432/mediaflow?sslmode=disable
-RABBITMQ_URL=amqp://mediaflow:mediaflow@localhost:5672/
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=mediaflow
-MINIO_SECRET_KEY=mediaflow-secret
-MINIO_USE_SSL=false
-MINIO_RAW_BUCKET=mediaflow-raw
-MINIO_PROCESSED_BUCKET=mediaflow-processed
-MINIO_THUMBNAIL_BUCKET=mediaflow-thumbnails
-WORKER_CONCURRENCY=1
-WORK_DIR=/tmp/mediaflow-worker
-FFMPEG_PATH=ffmpeg
-FFPROBE_PATH=ffprobe
+POST   /videos/upload            # multipart proxy upload (replaced in M5)
+GET    /videos
+GET    /videos/:id
+GET    /videos/:id/playback      # presigned master.m3u8 (replaced in M7)
+GET    /health
 ```
 
-### Web
+Error shape: `{"error": {"code": "...", "message": "..."}}` with 400/404/409/413/415/500/503 mapping.
+
+### Queue contract
 
 ```txt
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
+exchange: mediaflow.video (direct, durable)
+queue/routing key: video.transcode
+payload: { jobId, videoId, rawBucket, rawObjectKey, requestedAt }
 ```
 
-## Repository Shape
+The payload struct is duplicated in `apps/api/internal/videos/types.go` and
+`apps/worker/internal/job/types.go`; keep them in sync.
 
-Start simple. Avoid premature microservice sprawl.
+### Storage layout
 
 ```txt
-/apps
-  /api                 # Go API: upload, metadata, playback URLs
-  /worker              # Go or Python worker: FFmpeg processing pipeline
-  /web                 # Next.js frontend
-
-/packages
-  /shared              # Shared contracts/types/config if needed later
-
-/infrastructure
-  docker-compose.yml   # Postgres, RabbitMQ, Redis, MinIO
-  /migrations          # Database migrations
+raw-videos/{videoId}/original.mp4                      # mediaflow-raw (private)
+processed-videos/{videoId}/master.m3u8                 # mediaflow-processed
+processed-videos/{videoId}/{quality}/index.m3u8
+processed-videos/{videoId}/{quality}/segment_NNN.ts
+thumbnails/{videoId}/default.jpg                       # mediaflow-thumbnails
 ```
 
-Later, `api` can be split into upload, metadata, streaming, analytics, and notification services if the project needs that scale.
+Deterministic paths so retries can safely overwrite partial output. Original
+filenames live only in PostgreSQL, never in object keys.
 
-## Detailed Service Responsibilities
+### Renditions
 
-### Web App
-
-Responsibilities:
-
-- Render upload UI.
-- Send multipart upload request to the API.
-- Show video list and video processing state.
-- Poll video status until it becomes `ready` or `failed`.
-- Render HLS playback with `hls.js`.
-- Handle basic playback errors, such as missing manifest or video not ready.
-
-Non-responsibilities for MVP:
-
-- No auth.
-- No direct MinIO credentials in the browser.
-- No transcoding logic.
-
-### API App
-
-Responsibilities:
-
-- Validate upload requests.
-- Create video IDs.
-- Store original video in MinIO.
-- Write metadata rows to PostgreSQL.
-- Create a `video_jobs` row.
-- Publish a RabbitMQ message.
-- Return quickly after queueing.
-- Expose video status, metadata, playback URL, and event logs.
-- Ensure bucket existence on startup or through a setup command.
-
-Non-responsibilities for MVP:
-
-- No FFmpeg processing.
-- No long-running job execution inside request handlers.
-- No CDN behavior.
-
-### Worker App
-
-Responsibilities:
-
-- Consume `video.transcode` messages.
-- Claim the corresponding job.
-- Set video status to `processing`.
-- Download raw video from MinIO.
-- Run `ffprobe` to get metadata.
-- Run FFmpeg to generate HLS renditions.
-- Generate thumbnail.
-- Upload processed outputs to MinIO.
-- Insert `video_variants`.
-- Set video status to `ready`.
-- Ack successful messages.
-- Mark failed jobs/videos and nack or dead-letter unrecoverable messages.
-
-Non-responsibilities for MVP:
-
-- No user-facing API.
-- No recommendation logic.
-- No distributed chunk-level processing.
-
-## MVP Scope
-
-Phase 1 must include:
-
-1. Upload video from UI.
-2. Store original file in MinIO.
-3. Save video metadata in PostgreSQL with status `uploaded`.
-4. Publish RabbitMQ job.
-5. Worker consumes job.
-6. FFmpeg generates HLS outputs for `720p`, `480p`, and optionally `360p`.
-7. Worker generates thumbnail.
-8. Upload processed HLS files and thumbnail to MinIO.
-9. Update DB status to `ready`.
-10. Playback page loads `master.m3u8` with `hls.js`.
-
-## Deferred Scope
-
-Do not build these until the core pipeline works:
-
-- Auth
-- Likes/comments
-- Recommendations
-- AI moderation
-- AI subtitles
-- Livestreaming
-- Shorts/reels
-- WebRTC low latency
-- CDN integration
-- Kubernetes deployment
-- Resumable uploads
-- Distributed workers
-
-## Video Lifecycle
-
-```txt
-uploading
-  -> uploaded
-  -> queued
-  -> processing
-  -> ready
-```
-
-Failure path:
-
-```txt
-uploading/uploaded/queued/processing
-  -> failed
-```
-
-State transition rules:
-
-- `uploading`: optional temporary state while metadata row exists before object upload finishes.
-- `uploaded`: original object exists in MinIO.
-- `queued`: RabbitMQ message was published and DB job exists.
-- `processing`: worker has claimed the job.
-- `ready`: HLS master manifest, variants, and thumbnail are available.
-- `failed`: pipeline failed. `error_message` should explain the failure.
-
-Avoid silent transitions. Each meaningful transition should write a `video_events` row.
-
-## Initial Database Draft
-
-### `users`
-
-Can be skipped in the first local MVP if auth is deferred, but keep the design ready.
-
-```txt
-id
-email
-display_name
-created_at
-updated_at
-```
-
-### `videos`
-
-```txt
-id
-user_id
-title
-description
-status                    # uploading | uploaded | queued | processing | ready | failed
-raw_object_key
-hls_master_key
-thumbnail_key
-duration_seconds
-original_filename
-content_type
-size_bytes
-error_message
-created_at
-updated_at
-```
-
-### `video_variants`
-
-```txt
-id
-video_id
-quality                   # 720p | 480p | 360p
-width
-height
-bitrate
-codec
-playlist_key
-created_at
-```
-
-### `video_jobs`
-
-```txt
-id
-video_id
-job_type                  # transcode
-status                    # queued | processing | completed | failed
-attempts
-last_error
-created_at
-updated_at
-```
-
-### `video_events`
-
-Useful for debugging the pipeline.
-
-```txt
-id
-video_id
-event_type
-message
-metadata_json
-created_at
-```
-
-## Suggested SQL Schema
-
-This is not final migration syntax, but it is close enough to implement from.
-
-```sql
-CREATE TYPE video_status AS ENUM (
-  'uploading',
-  'uploaded',
-  'queued',
-  'processing',
-  'ready',
-  'failed'
-);
-
-CREATE TYPE job_status AS ENUM (
-  'queued',
-  'processing',
-  'completed',
-  'failed'
-);
-
-CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  email TEXT UNIQUE,
-  display_name TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE videos (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id),
-  title TEXT NOT NULL,
-  description TEXT,
-  status video_status NOT NULL,
-  raw_object_key TEXT,
-  hls_master_key TEXT,
-  thumbnail_key TEXT,
-  duration_seconds NUMERIC,
-  original_filename TEXT,
-  content_type TEXT,
-  size_bytes BIGINT,
-  error_message TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_videos_status ON videos(status);
-CREATE INDEX idx_videos_created_at ON videos(created_at DESC);
-
-CREATE TABLE video_variants (
-  id UUID PRIMARY KEY,
-  video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-  quality TEXT NOT NULL,
-  width INT NOT NULL,
-  height INT NOT NULL,
-  bitrate INT NOT NULL,
-  codec TEXT,
-  playlist_key TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(video_id, quality)
-);
-
-CREATE TABLE video_jobs (
-  id UUID PRIMARY KEY,
-  video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-  job_type TEXT NOT NULL,
-  status job_status NOT NULL,
-  attempts INT NOT NULL DEFAULT 0,
-  last_error TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_video_jobs_status ON video_jobs(status);
-CREATE INDEX idx_video_jobs_video_id ON video_jobs(video_id);
-
-CREATE TABLE video_events (
-  id UUID PRIMARY KEY,
-  video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-  event_type TEXT NOT NULL,
-  message TEXT NOT NULL,
-  metadata_json JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_video_events_video_id_created_at ON video_events(video_id, created_at DESC);
-```
-
-## Queue Design
-
-Start with one queue:
-
-```txt
-video.transcode
-```
-
-Initial job payload:
-
-```json
-{
-  "jobId": "uuid",
-  "videoId": "uuid",
-  "rawBucket": "mediaflow-raw",
-  "rawObjectKey": "raw-videos/video-id/original.mp4",
-  "requestedAt": "2026-05-29T00:00:00Z"
-}
-```
-
-RabbitMQ settings for MVP:
-
-```txt
-exchange: mediaflow.video
-exchange_type: direct
-queue: video.transcode
-routing_key: video.transcode
-durable: true
-message_delivery_mode: persistent
-prefetch_count: 1
-```
-
-Retry strategy for MVP:
-
-- On transient failure, increment `attempts`.
-- Retry up to `3` attempts.
-- After max attempts, mark job and video as `failed`.
-- Add dead-letter queue later: `video.transcode.dlq`.
-
-Later queues:
-
-```txt
-video.thumbnail
-video.completed
-video.failed
-video.ai_moderation
-video.subtitle
-```
-
-## Storage Layout
-
-Raw uploads:
-
-```txt
-raw-videos/{videoId}/original.mp4
-```
-
-Processed HLS:
-
-```txt
-processed-videos/{videoId}/master.m3u8
-processed-videos/{videoId}/720p/index.m3u8
-processed-videos/{videoId}/720p/segment_000.ts
-processed-videos/{videoId}/480p/index.m3u8
-processed-videos/{videoId}/480p/segment_000.ts
-processed-videos/{videoId}/360p/index.m3u8
-processed-videos/{videoId}/360p/segment_000.ts
-```
-
-Thumbnails:
-
-```txt
-thumbnails/{videoId}/default.jpg
-```
-
-Bucket policy:
-
-- Raw bucket should remain private.
-- Processed and thumbnail buckets can remain private with presigned URLs.
-- Public bucket access can be considered only for local convenience.
-
-Path conventions:
-
-- Always include `videoId` in object keys.
-- Avoid using original filenames in object keys.
-- Store original filename only as metadata in PostgreSQL.
-- Use deterministic paths so retrying a job can overwrite partial output safely after cleanup.
-
-## FFmpeg Processing Plan
-
-Worker responsibilities:
-
-1. Download original video from MinIO.
-2. Probe metadata with `ffprobe`.
-3. Generate thumbnail.
-4. Generate HLS variants.
-5. Upload generated files to MinIO.
-6. Update `videos` and `video_variants`.
-7. Mark job completed or failed.
-
-Initial qualities:
-
-| Quality | Resolution | Approx Bitrate |
+| Quality | Resolution | Approx bitrate |
 | --- | --- | --- |
 | 720p | 1280x720 | 2800k |
 | 480p | 854x480 | 1400k |
 | 360p | 640x360 | 800k |
 
-### Metadata Probe
+Skip variants above source height. H.264 + AAC, 4s MPEG-TS segments, VOD playlists.
 
-Use `ffprobe` before transcoding:
+## Known Weaknesses Driving Phase 2
 
-```bash
-ffprobe -v error \
-  -show_entries format=duration,size,bit_rate \
-  -show_entries stream=codec_type,codec_name,width,height \
-  -of json \
-  input.mp4
+These exist in the code today. Each is the seed of a milestone.
+
+1. **Dual-write problem** — `Service.Upload` (`apps/api/internal/videos/service.go`)
+   does MinIO write → DB insert → RabbitMQ publish with no transaction spanning
+   them. A failed publish strands a `queued` video forever. → M4 outbox.
+2. **Stuck-job deadlock** — if a worker dies mid-transcode, RabbitMQ redelivers,
+   but `ClaimJob` sees the job already claimed and skips it. The video is stuck
+   in `processing` with no recovery path. → M4 leases + reaper.
+3. **No retries** — `video_jobs.attempts` is never incremented; failures Nack
+   without requeue; there is no DLQ. → M4 retry/backoff/DLQ.
+4. **Ingest bottleneck** — the API proxies entire uploads (up to 500MB) through
+   its own memory/network; uploads are not resumable. → M5 presigned multipart.
+5. **Monolithic transcode** — one worker transcodes all renditions of a video
+   serially in a single job; horizontal scaling is coarse. → M6 fan-out.
+6. **Fake playback security** — only `master.m3u8` is presigned; variant
+   playlists and segments are served from anonymous-download buckets. There is
+   no caching tier. → M7 signed manifests + edge cache.
+7. **Blind pipeline** — no traces, no metrics, no dashboards; Redis is
+   provisioned and entirely unused. → M7/M8.
+8. **No evidence** — no load tests, no chaos testing, no stated SLOs. → M9.
+
+---
+
+## Milestone 4: Correctness Under Failure
+
+The pipeline must survive any single component dying at any moment, with every
+video eventually `ready` or `failed` — never stuck.
+
+### 4.1 Transactional outbox
+
+- New `outbox_messages` table. `Upload` writes video + job + outbox row in one
+  DB transaction and never talks to RabbitMQ directly.
+- A relay loop in the API process polls the outbox (`FOR UPDATE SKIP LOCKED`),
+  publishes with publisher confirms, marks rows sent. Delivery is at-least-once;
+  consumers must be idempotent (they already partially are).
+
+```sql
+CREATE TABLE outbox_messages (
+  id UUID PRIMARY KEY,
+  exchange TEXT NOT NULL,
+  routing_key TEXT NOT NULL,
+  payload_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  published_at TIMESTAMPTZ
+);
+CREATE INDEX idx_outbox_unpublished ON outbox_messages(created_at) WHERE published_at IS NULL;
 ```
 
-Use this to:
+### 4.2 Leases, heartbeats, reaper
 
-- Save duration.
-- Validate that a video stream exists.
-- Skip variants larger than the source resolution.
-- Decide whether audio exists.
+- `video_jobs` gains `claimed_by TEXT` and `lease_expires_at TIMESTAMPTZ`.
+- Claiming a job sets both (lease ~2 minutes) and increments `attempts`.
+- The worker heartbeats every ~30s to extend the lease while FFmpeg runs.
+- A reaper (ticker in the worker process, or `cmd/reaper`) scans for expired
+  leases: below max attempts → reset to `queued` and re-enqueue via the outbox;
+  at max attempts → mark job and video `failed`.
 
-### Thumbnail Command
+### 4.3 Retries, backoff, DLQ
 
-Generate one thumbnail around the first few seconds:
+- Max 3 attempts per job.
+- Transient failure below max attempts → publish to `video.transcode.retry`
+  with per-message TTL (30s · 2^attempts); that queue's dead-letter exchange
+  routes the message back to `video.transcode`.
+- Exhausted or poison messages → `video.transcode.dlq`, video marked `failed`.
+- Distinguish permanent failures (corrupt input, no video stream) and skip
+  retries for them.
 
-```bash
-ffmpeg -y \
-  -ss 00:00:03 \
-  -i input.mp4 \
-  -frames:v 1 \
-  -vf "scale=640:-1" \
-  thumbnail.jpg
-```
+### 4.4 Idempotency and clean shutdown
 
-If the video is shorter than 3 seconds, fall back to `00:00:00`.
+- Upload accepts an `Idempotency-Key` header; replays return the original
+  response instead of creating a duplicate video.
+- Worker retry hygiene: skip if video already `ready`; clear stale
+  `video_variants`; deterministic output keys overwrite partial output.
+- Graceful shutdown: on SIGTERM stop consuming, finish the in-flight job within
+  a deadline, then exit. `kill -9` is what the reaper is for.
 
-### HLS Command Direction
+### Done when
 
-The final command may be adjusted during implementation, but the goal is:
+- `kill -9` on the worker mid-transcode: the lease expires, the reaper
+  requeues, another run completes, the video becomes `ready`.
+- RabbitMQ stopped during an upload: the upload still succeeds and the outbox
+  drains after RabbitMQ returns.
+- A poison message lands in the DLQ without wedging the consumer.
+- Every status transition is visible in `video_events`.
 
-- Generate a `master.m3u8`.
-- Generate one playlist per quality.
-- Generate 4 to 6 second segments.
-- Use H.264 video and AAC audio for broad compatibility.
+## Milestone 5: Scalable Ingest
 
-Example direction:
+The API becomes a control plane; video bytes flow directly between the browser
+and object storage via presigned multipart uploads, resumable across reloads.
 
-```bash
-ffmpeg -y -i input.mp4 \
-  -filter_complex \
-  "[0:v]split=3[v720][v480][v360]; \
-   [v720]scale=w=1280:h=720:force_original_aspect_ratio=decrease[v720out]; \
-   [v480]scale=w=854:h=480:force_original_aspect_ratio=decrease[v480out]; \
-   [v360]scale=w=640:h=360:force_original_aspect_ratio=decrease[v360out]" \
-  -map "[v720out]" -map 0:a? -c:v:0 libx264 -b:v:0 2800k -maxrate:v:0 2996k -bufsize:v:0 4200k \
-  -map "[v480out]" -map 0:a? -c:v:1 libx264 -b:v:1 1400k -maxrate:v:1 1498k -bufsize:v:1 2100k \
-  -map "[v360out]" -map 0:a? -c:v:2 libx264 -b:v:2 800k -maxrate:v:2 856k -bufsize:v:2 1200k \
-  -c:a aac -ar 48000 -b:a 128k \
-  -preset veryfast \
-  -g 48 -keyint_min 48 -sc_threshold 0 \
-  -hls_time 4 \
-  -hls_playlist_type vod \
-  -hls_segment_filename "out/%v/segment_%03d.ts" \
-  -master_pl_name master.m3u8 \
-  -var_stream_map "v:0,a:0 v:1,a:1 v:2,a:2" \
-  out/%v/index.m3u8
-```
+### Design
 
-Implementation note:
-
-- The `var_stream_map` needs care when input has no audio.
-- Start with a known sample video that has audio.
-- Then add no-audio handling.
-- If the source is lower than 720p, generate only variants at or below source height.
-
-### Worker Temporary Directory
-
-For each job:
+- New `upload_sessions` table: id, title/description, object key, MinIO
+  multipart `upload_id`, part size, declared total size, optional SHA-256,
+  status (`pending | uploading | completed | aborted | expired`), `expires_at`.
+- Endpoints:
 
 ```txt
-/tmp/mediaflow-worker/{jobId}/
-  input.mp4
-  thumbnail.jpg
-  hls/
-    master.m3u8
-    0/
-    1/
-    2/
+POST   /uploads                      # create session, initiate multipart
+GET    /uploads/:id                  # session status + already-uploaded parts (resume)
+GET    /uploads/:id/parts/:n/url     # presigned URL for part n
+POST   /uploads/:id/complete         # complete multipart, validate, enqueue via outbox
+DELETE /uploads/:id                  # abort multipart
 ```
 
-Cleanup rules:
+- Completion validates declared size and part checksums (ETags), then creates
+  video + job + outbox row in one transaction — reusing the M4 machinery.
+- A cleanup loop aborts expired sessions and their MinIO multipart uploads.
+- Size limits enforced at session creation (declared) and completion (actual).
+- Web uploader: slice the file, upload parts with bounded concurrency, retry
+  individual parts, persist the session id so a page reload resumes from
+  `GET /uploads/:id`, show real progress.
+- The legacy proxy endpoint `POST /videos/upload` is removed (or kept briefly
+  behind a flag for comparison benchmarks in M9).
 
-- Remove job temp directory after success.
-- Remove job temp directory after failure if logs are enough.
-- Keep local temp files only while debugging.
+### Done when
 
-### Idempotency
+- A 500MB upload never transits the API process.
+- Killing the tab mid-upload and reloading resumes from the completed parts.
+- A tampered part (checksum mismatch) fails completion cleanly.
 
-The worker should be safe to retry.
+## Milestone 6: Distributed Transcoding
 
-Before processing a retry:
+Replace the monolithic transcode job with a fan-out/aggregate pipeline so N
+workers share one video's work — the map-reduce shape real video platforms use.
 
-- Check if video is already `ready`; if yes, ack and skip.
-- Clear stale `video_variants` for that video.
-- Overwrite processed object keys for that video.
-- Keep raw upload untouched.
+### Design
 
-## Frontend Pages
+- Job hierarchy in `video_jobs`: `parent_job_id`, `job_type` of
+  `plan | rendition | finalize`.
+- **Planner** consumes `video.transcode`: downloads source, runs ffprobe, makes
+  the thumbnail, decides target renditions, creates per-rendition job rows, and
+  fans out messages to `video.rendition` via the outbox.
+- **Rendition workers** consume `video.rendition`: each transcodes exactly one
+  quality (per-variant playlist + segments) and uploads it. Leases, heartbeats,
+  retries from M4 apply per rendition — one quality failing and retrying does
+  not redo the others.
+- **Aggregation**: completion of each rendition atomically decrements a pending
+  counter (`UPDATE ... RETURNING` in Postgres). Whoever completes the last
+  rendition triggers finalize: write `master.m3u8` referencing the finished
+  variants, insert `video_variants`, mark the video `ready`.
+- Partial failure: a rendition exhausting retries fails the whole video and
+  cleans up; already-finished sibling renditions are noted in `video_events`.
+- Run multiple workers (`docker compose up --scale worker=3` or N processes)
+  and demonstrate parallel speedup on a single video.
+- Autoscaling experiment: poll queue depth via the RabbitMQ management API and
+  scale workers; record the results (KEDA is the k8s version of this later).
+- Stretch goal: segment-level parallelism — split the source into time chunks,
+  transcode chunks of one rendition across workers, stitch the playlists.
 
-### Upload Page
+### Done when
 
-Required behavior:
+- Three workers make one video ready measurably faster than one worker.
+- Two renditions finishing simultaneously do not double-finalize (the counter
+  race is tested).
+- A rendition failure mid-fan-out converges to `failed`, never to a stuck state.
 
-- Select MP4 file.
-- Enter title and description.
-- Upload to backend.
-- Show upload/progress status if simple to implement.
-- Redirect to video status page or watch page.
+## Milestone 7: Serving At Scale
 
-UX states:
+Answer the playback question properly: no anonymous buckets, short-lived signed
+URLs for every object, and a caching tier in front of storage.
 
-- Empty form.
-- File selected.
-- Uploading.
-- Queued.
-- Upload failed.
+### Design
 
-Validation:
-
-- Require title.
-- Require file.
-- Accept `video/mp4`.
-- Show clear error when backend rejects file size or type.
-
-### Video Status Page
-
-Required behavior:
-
-- Poll video status.
-- Show processing state while worker runs.
-- Link to playback when status is `ready`.
-- Show error if status is `failed`.
-
-Polling:
-
-- Poll `GET /videos/:id` every 2 seconds while status is `queued` or `processing`.
-- Stop polling when status is `ready` or `failed`.
-
-### Watch Page
-
-Required behavior:
-
-- Load video metadata.
-- Load HLS URL.
-- Use `hls.js` for browsers without native HLS support.
-- Support automatic adaptive bitrate switching through HLS.
-
-Playback logic:
+- Remove `mc anonymous set download` from the MinIO setup; all buckets private.
+- **Manifest rewriting**: the API serves playlists and signs segment URLs:
 
 ```txt
-if video.canPlayType("application/vnd.apple.mpegurl"):
-  video.src = hlsUrl
-else if Hls.isSupported():
-  const hls = new Hls()
-  hls.loadSource(hlsUrl)
-  hls.attachMedia(video)
-else:
-  show unsupported browser error
+GET /videos/:id/hls/master.m3u8            # variant URIs point back at the API
+GET /videos/:id/hls/:quality/index.m3u8    # segment URIs point at nginx, HMAC-signed
 ```
 
-Optional but useful controls:
+  Segment URLs carry an expiry and an HMAC over (path, expiry) using a shared
+  secret (`PLAYBACK_HMAC_SECRET`).
+- **nginx edge cache** (CDN stand-in) in Docker Compose: validates signatures
+  with `secure_link`, proxies misses to MinIO, caches segments aggressively
+  (immutable, long TTL) and playlists briefly. This is where cache hit ratio,
+  keys, and invalidation get real.
+- **Redis finally earns its keep**: cache rewritten manifests (TTL shorter than
+  token expiry), token-bucket rate limiting on playback endpoints, view
+  counters via `INCR` flushed periodically to Postgres.
+- The web player switches to the manifest endpoint; quality selection keeps
+  working because variant playlists still flow through hls.js.
 
-- Show title and thumbnail.
-- Show processing status if user reaches watch page too early.
-- Show available variants for debugging.
+### Done when
 
-## Backend API Draft
+- Anonymous fetch of any segment fails; a signed URL works until expiry and
+  401s after.
+- Repeat playback of the same video shows nginx cache hits, not MinIO reads.
+- A rate-limited client gets 429s while others stream unaffected.
 
-```txt
-POST   /videos/upload
-GET    /videos
-GET    /videos/:id
-GET    /videos/:id/playback
-GET    /health
-```
+## Milestone 8: Observability
 
-### `POST /videos/upload`
+One trace from upload to `ready`, metrics for every stage, dashboards that make
+queue lag and failure visible at a glance.
 
-Request:
+### Design
 
-```txt
-Content-Type: multipart/form-data
+- OpenTelemetry tracing in the API (Gin middleware) and worker. Trace context
+  is injected into AMQP message headers by the outbox relay and extracted by
+  consumers, so a single trace spans HTTP → queue → planner → renditions →
+  finalize. Spans per worker stage: download, probe, thumbnail, transcode,
+  upload, finalize.
+- Prometheus metrics: HTTP latency/RPS/error rate (API); job duration per
+  stage and per rendition, success/failure/retry counters (worker); queue depth
+  and consumer counts (RabbitMQ prometheus plugin); cache hit ratio (nginx).
+- Docker Compose grows `jaeger`, `prometheus`, `grafana` services with
+  provisioned dashboards: pipeline health (queue depth, in-flight jobs, time-
+  to-ready p50/p95, failure rate) and API health.
+- Structured logging (`slog`) in both Go apps with trace/correlation IDs on
+  every line; `video_events` rows carry the trace id in `metadata_json`.
+- Draft alert rules: queue lag, error rate, jobs stuck in `processing`.
 
-fields:
-  title: string
-  description: string optional
-  file: mp4 file
-```
+### Done when
 
-Response:
+- Jaeger shows one trace covering an upload through `ready`, including the
+  queue hop and parallel rendition spans.
+- The Grafana pipeline dashboard makes a killed worker or a queue backlog
+  visible without reading logs.
 
-```json
-{
-  "id": "uuid",
-  "title": "Demo video",
-  "status": "queued",
-  "createdAt": "2026-05-29T00:00:00Z"
-}
-```
+## Milestone 9: Proof — SLOs, Load, Chaos
 
-Important behavior:
+"Hardcore" means demonstrated, not claimed. State objectives, push the system
+until they break, break the system on purpose, and write down what happened.
 
-- Validate file type and size.
-- Create video row.
-- Upload raw object.
-- Create job row.
-- Publish RabbitMQ message.
-- Return `202 Accepted` or `201 Created`.
+### Design
 
-### `GET /videos`
+- **SLOs** (tune to local hardware, but state them in `docs/SLOS.md`), e.g.:
+  - p95 upload-session creation < 100ms
+  - p95 time-to-ready for a 60s 720p source < 90s with 3 workers
+  - p95 playback manifest latency < 50ms warm
+  - 0 videos stuck in a non-terminal state after any chaos scenario
+- **k6 load tests** under `tests/load/`: upload throughput (multipart flow),
+  playback concurrency against the edge cache, and a sustained soak of
+  continuous uploads. Results recorded against the SLOs.
+- **Chaos suite** under `tests/chaos/` — scripted scenarios, each with a
+  postmortem in `docs/postmortems/` (timeline, observed behavior, gaps found,
+  fixes filed):
+  1. `kill -9` a rendition worker mid-transcode
+  2. Restart RabbitMQ under load
+  3. MinIO unavailable during transcode
+  4. `WORK_DIR` disk full
+  5. Postgres restart under load
+- **E2E smoke script** that runs the full upload → ready → playback path
+  against a fresh compose stack.
+- **Docs**: architecture diagram of the final system and short ADRs in
+  `docs/adr/` for the major decisions (outbox, leases, fan-out, manifest
+  signing).
 
-Response:
+### Done when
 
-```json
-{
-  "items": [
-    {
-      "id": "uuid",
-      "title": "Demo video",
-      "status": "ready",
-      "thumbnailUrl": "http://...",
-      "createdAt": "2026-05-29T00:00:00Z"
-    }
-  ]
-}
-```
+- Every chaos scenario converges with zero stuck videos and has a postmortem.
+- Load test results vs SLOs are committed.
+- A newcomer can understand the system from the diagram and ADRs alone.
 
-### `GET /videos/:id`
-
-Response:
-
-```json
-{
-  "id": "uuid",
-  "title": "Demo video",
-  "description": "Optional text",
-  "status": "processing",
-  "durationSeconds": 123.45,
-  "thumbnailUrl": null,
-  "errorMessage": null,
-  "variants": [
-    {
-      "quality": "720p",
-      "width": 1280,
-      "height": 720,
-      "bitrate": 2800000
-    }
-  ],
-  "createdAt": "2026-05-29T00:00:00Z",
-  "updatedAt": "2026-05-29T00:00:00Z"
-}
-```
-
-### `GET /videos/:id/playback`
-
-Response when ready:
-
-```json
-{
-  "videoId": "uuid",
-  "hlsUrl": "http://localhost:9000/mediaflow-processed/processed-videos/uuid/master.m3u8?...",
-  "expiresAt": "2026-05-29T01:00:00Z"
-}
-```
-
-Response when not ready:
-
-```json
-{
-  "error": "video_not_ready",
-  "status": "processing"
-}
-```
-
-Possible later APIs:
-
-```txt
-POST   /videos/:id/retry
-DELETE /videos/:id
-GET    /videos/:id/events
-```
-
-## API Error Shape
-
-Use one predictable JSON error response:
-
-```json
-{
-  "error": {
-    "code": "invalid_file_type",
-    "message": "Only MP4 uploads are supported in the MVP."
-  }
-}
-```
-
-Recommended HTTP status mapping:
-
-| Case | Status |
-| --- | --- |
-| Invalid input | 400 |
-| File too large | 413 |
-| Unsupported file type | 415 |
-| Video not found | 404 |
-| Video not ready | 409 |
-| Internal error | 500 |
-| Dependency unavailable | 503 |
-
-## Docker Compose Services
-
-Required local services:
-
-```txt
-postgres
-  host port: 55432
-  container port: 5432
-  database: mediaflow
-  user: mediaflow
-  password: mediaflow
-
-rabbitmq
-  ports: 5672, 15672
-  management UI: http://localhost:15672
-  user: mediaflow
-  password: mediaflow
-
-redis
-  port: 6379
-
-minio
-  ports: 9000, 9001
-  console: http://localhost:9001
-  access key: mediaflow
-  secret key: mediaflow-secret
-```
-
-Buckets to create:
-
-```txt
-mediaflow-raw
-mediaflow-processed
-mediaflow-thumbnails
-```
-
-## Observability And Debugging
-
-Minimum useful logs:
-
-- API startup config summary with secrets redacted.
-- Upload request started.
-- Upload stored to MinIO.
-- DB video row created.
-- Queue job published.
-- Worker message received.
-- Worker ffprobe result summary.
-- Worker FFmpeg command started.
-- Worker HLS output uploaded.
-- Worker job completed.
-- Worker job failed with error.
-
-Minimum useful events in DB:
-
-```txt
-video.upload.started
-video.upload.completed
-video.job.queued
-video.processing.started
-video.probe.completed
-video.thumbnail.generated
-video.hls.generated
-video.processing.completed
-video.processing.failed
-```
-
-## Testing Plan
-
-### Manual Smoke Test
-
-1. Start Docker Compose.
-2. Start API.
-3. Start worker.
-4. Start web app.
-5. Upload a small MP4.
-6. Confirm DB row is `queued`.
-7. Confirm RabbitMQ message is consumed.
-8. Confirm status changes to `processing`.
-9. Confirm processed HLS files exist in MinIO.
-10. Confirm status changes to `ready`.
-11. Open watch page.
-12. Confirm playback works.
-13. Open browser devtools network tab.
-14. Confirm `.m3u8` and `.ts` files are being loaded.
-
-### API Tests
-
-Test cases:
-
-- Health check returns OK.
-- Upload rejects missing file.
-- Upload rejects unsupported content type.
-- Upload creates video row.
-- Upload publishes queue message.
-- `GET /videos/:id` returns status.
-- Playback endpoint rejects non-ready videos.
-
-### Worker Tests
-
-Test cases:
-
-- Worker can parse a valid job payload.
-- Worker marks job failed for missing raw object.
-- Worker runs ffprobe on sample input.
-- Worker generates thumbnail.
-- Worker generates HLS output.
-- Worker writes variants.
-- Worker is idempotent when video is already `ready`.
-
-### End-To-End Test
-
-Use a tiny sample MP4 committed under a test fixture folder only if licensing is safe. Otherwise document how to generate one:
-
-```bash
-ffmpeg -f lavfi -i testsrc=size=1280x720:rate=30 \
-  -f lavfi -i sine=frequency=1000:sample_rate=48000 \
-  -t 10 \
-  -c:v libx264 \
-  -c:a aac \
-  sample.mp4
-```
+---
 
 ## Build Order
 
-1. Initialize repo structure.
-2. Add Docker Compose for PostgreSQL, RabbitMQ, Redis, and MinIO.
-3. Add database migrations.
-4. Build Go API skeleton with health check.
-5. Add MinIO client and upload endpoint.
-6. Save video metadata to PostgreSQL.
-7. Publish RabbitMQ transcode job.
-8. Build worker skeleton that consumes jobs.
-9. Add FFmpeg/ffprobe integration.
-10. Generate HLS files locally.
-11. Upload processed files to MinIO.
-12. Update DB status and variants.
-13. Build Next.js upload page.
-14. Build processing status page.
-15. Build watch page with `hls.js`.
-16. Add error handling, retries, and job logs.
+Strictly in milestone order — correctness before scale, scale before polish:
 
-## Milestone Breakdown
+1. M4: outbox → leases/reaper → retries/DLQ → idempotency → shutdown → chaos checks.
+2. M5: sessions table → API endpoints → web uploader → remove proxy path.
+3. M6: job hierarchy → planner → rendition workers → aggregation → multi-worker runs.
+4. M7: private buckets → manifest endpoints → signing → nginx → Redis.
+5. M8: tracing → metrics → compose services → dashboards.
+6. M9: SLOs → load tests → chaos suite → postmortems → final docs.
 
-### Milestone 0: Repo And Infra
+Each milestone lands with tests, a `PROGRESS.md` update, and migrations under
+`infrastructure/migrations/` (numbered `000002_...` onward).
 
-Done when:
+## New Environment Variables (introduced per milestone)
 
-- Repo folders exist.
-- Docker Compose starts Postgres, RabbitMQ, Redis, and MinIO.
-- Buckets are created.
-- Migrations run.
-- README has local startup commands.
+```txt
+M4: OUTBOX_POLL_INTERVAL, JOB_LEASE_SECONDS, JOB_MAX_ATTEMPTS, WORKER_ID
+M5: UPLOAD_SESSION_TTL, UPLOAD_PART_SIZE
+M7: PLAYBACK_HMAC_SECRET, EDGE_BASE_URL, REDIS_ADDR (finally used)
+M8: OTEL_EXPORTER_OTLP_ENDPOINT, METRICS_ADDR
+```
 
-### Milestone 1: API Upload Path
-
-Done when:
-
-- `POST /videos/upload` accepts MP4.
-- Raw object appears in MinIO.
-- Video row appears in DB.
-- Job row appears in DB.
-- RabbitMQ message is published.
-
-### Milestone 2: Worker Transcoding Path
-
-Done when:
-
-- Worker consumes the job.
-- FFprobe metadata is saved.
-- HLS output is generated.
-- Thumbnail is generated.
-- Processed files are uploaded.
-- Video status becomes `ready`.
-
-### Milestone 3: Web Playback Path
-
-Done when:
-
-- Web app uploads video.
-- Status page shows progress.
-- Watch page plays HLS stream.
-- Browser network panel shows manifest and segment requests.
-
-### Milestone 4: Hardening
-
-Done when:
-
-- Failed transcodes show useful errors.
-- Retry behavior is defined.
-- Logs are readable.
-- Large files are rejected cleanly.
-- No transcoding happens inside API request path.
-
-## Success Criteria For MVP
-
-- A local user can upload an MP4.
-- The API returns quickly after upload and does not transcode synchronously.
-- RabbitMQ contains and dispatches the processing job.
-- Worker generates HLS output with multiple qualities.
-- `master.m3u8` is playable from the frontend.
-- Player automatically switches quality using HLS adaptive bitrate behavior.
-- Video status is visible as `queued`, `processing`, `ready`, or `failed`.
-
-## Acceptance Checklist
-
-- [ ] `docker compose up` starts required dependencies.
-- [ ] Migrations create required tables.
-- [ ] API health check works.
-- [ ] Upload endpoint stores raw MP4 in MinIO.
-- [ ] Upload endpoint publishes `video.transcode`.
-- [ ] Worker receives and acknowledges jobs.
-- [ ] Worker updates status to `processing`.
-- [ ] Worker creates thumbnail.
-- [ ] Worker creates `master.m3u8`.
-- [ ] Worker creates at least two quality variants.
-- [ ] Worker uploads HLS output to MinIO.
-- [ ] Worker updates status to `ready`.
-- [ ] Playback endpoint returns HLS URL.
-- [ ] Frontend upload page works.
-- [ ] Frontend status page works.
-- [ ] Frontend watch page works.
-- [ ] Failed processing updates DB with an error message.
-- [ ] README explains how to run the MVP locally.
+Keep `.env.example` files current when these land.
 
 ## Key Engineering Rules
 
-- Do not stream raw MP4 as the primary playback strategy.
-- Do not transcode inside the upload request.
-- Do not build production microservices before the local pipeline works.
-- Keep the first version observable: clear logs, status fields, and failure messages.
-- Prefer working end-to-end over building isolated pieces that cannot be tested together.
+- Do not transcode inside any HTTP request path.
+- Every queue consumer must be idempotent; delivery is at-least-once everywhere.
+- No video may ever be stuck: every state must have a path to `ready` or `failed` driven by a timeout, retry, or reaper.
+- All DB-then-publish sequences go through the outbox; never dual-write.
+- Deterministic object keys so retries overwrite rather than duplicate.
+- Each milestone is proven by a failure drill or measurement, not just tests passing.
+- Keep contracts (queue payloads, object key layout, API JSON) in sync across `apps/api`, `apps/worker`, and `apps/web/lib/api.ts`.
 
-## Later Scaling Topics
+## Resolved Decisions
 
-- Resumable uploads with tus.io or multipart upload.
-- CDN in front of processed HLS files.
-- Worker autoscaling based on queue depth.
-- Dead letter queues.
-- Raw video lifecycle policies.
-- GPU-accelerated transcoding.
-- Kubernetes deployment.
-- Analytics events.
-- AI moderation and subtitles.
-- Recommendation system.
-
-## Production Evolution Path
-
-After MVP, grow in this order:
-
-1. Add auth and ownership.
-2. Add resumable uploads.
-3. Move from local MinIO to S3-compatible cloud storage.
-4. Add CDN in front of processed HLS assets.
-5. Add worker autoscaling.
-6. Add dead-letter queues and retry backoff.
-7. Add analytics events.
-8. Add comments/likes.
-9. Add AI subtitles and moderation.
-10. Add recommendation service.
-11. Add Kubernetes deployment.
-12. Add livestreaming or low-latency streaming only if explicitly needed.
+- Playback strategy: API manifest rewriting + HMAC-signed segment URLs behind an nginx edge cache (was an open question).
+- SQL access: stay on `database/sql` + pgx; no ORM.
+- Publish strategy: transactional outbox, at-least-once delivery.
+- Retry transport: RabbitMQ TTL retry queue + dead-letter exchange.
 
 ## Open Decisions
 
-Resolve these during implementation:
-
-- Worker language: Go keeps the stack consistent; Python may be faster for FFmpeg scripting. Default to Go unless FFmpeg orchestration becomes awkward.
-- Playback URL strategy: presigned MinIO URLs are easiest locally. API proxy is useful if we want full access control later.
-- Migration tool: choose a simple Go-friendly tool such as Goose or golang-migrate.
-- SQL access: choose between `database/sql`, `sqlc`, or an ORM. Prefer `sqlc` or `database/sql` for clarity in a systems portfolio project.
-- Monorepo tooling: keep minimal unless the frontend/backend integration needs shared generated types.
+- Segment-level parallel transcoding (M6 stretch): worth the stitching complexity locally, or document the design and skip?
+- CMAF/fMP4 segments instead of MPEG-TS: revisit if/when LL-HLS becomes interesting.
+- Kubernetes deployment with KEDA autoscaling: only after M9; local compose autoscaling experiment comes first.
+- Auth/multi-tenancy: deliberately out of scope for Phase 2; the `users` table stays dormant.

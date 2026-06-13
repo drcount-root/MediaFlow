@@ -28,7 +28,7 @@ export default async function HomePage() {
 
       {error ? <div className="alert error">{error}</div> : null}
 
-      {!error && videos.length === 0 ? (
+      {!error && videos?.length === 0 ? (
         <div className="panel">
           <div className="thumb">
             <Video size={34} />
@@ -38,7 +38,7 @@ export default async function HomePage() {
       ) : null}
 
       <section className="grid">
-        {videos.map((video) => (
+        {videos?.map((video) => (
           <Link key={video.id} href={video.status === "ready" ? `/watch/${video.id}` : `/videos/${video.id}`} className="video-card">
             <div className="thumb">
               {video.thumbnailUrl ? <img src={video.thumbnailUrl} alt="" /> : <Video size={32} />}

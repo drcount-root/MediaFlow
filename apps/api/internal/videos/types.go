@@ -16,6 +16,12 @@ const (
 	StatusFailed     = "failed"
 
 	JobTypeTranscode = "transcode"
+
+	// Queue contract for the transcode job. Defined here (the lowest layer) so
+	// both the queue publisher and the outbox writer can reference it without an
+	// import cycle.
+	VideoExchange       = "mediaflow.video"
+	TranscodeRoutingKey = "video.transcode"
 )
 
 var (
@@ -63,6 +69,13 @@ type CreateQueuedVideoParams struct {
 	OriginalFilename string
 	ContentType      string
 	SizeBytes        int64
+
+	// Outbox message published once the row is committed. Written in the same
+	// transaction as the video and job so the enqueue can never be lost or
+	// dual-written. The relay loop ships it to RabbitMQ.
+	OutboxExchange    string
+	OutboxRoutingKey  string
+	OutboxPayloadJSON []byte
 }
 
 type UploadParams struct {
@@ -93,8 +106,4 @@ type ObjectStorage interface {
 	UploadRaw(ctx context.Context, objectKey string, body io.Reader, size int64, contentType string) error
 	PresignedProcessedURL(ctx context.Context, objectKey string, expires time.Duration) (string, error)
 	PresignedThumbnailURL(ctx context.Context, objectKey string, expires time.Duration) (string, error)
-}
-
-type JobPublisher interface {
-	PublishTranscode(ctx context.Context, job TranscodeJob) error
 }

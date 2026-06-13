@@ -78,6 +78,17 @@ func (r *PostgresRepository) CreateQueuedVideo(ctx context.Context, params video
 		return videos.Video{}, err
 	}
 
+	// Outbox row in the same transaction: either everything commits (video + job
+	// + events + the message to publish) or nothing does. No dual-write to the
+	// broker on the request path.
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO outbox_messages (exchange, routing_key, payload_json)
+		VALUES ($1, $2, $3)
+	`, params.OutboxExchange, params.OutboxRoutingKey, params.OutboxPayloadJSON)
+	if err != nil {
+		return videos.Video{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return videos.Video{}, err
 	}

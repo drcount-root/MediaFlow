@@ -4,13 +4,14 @@ Last updated: 2026-06-13
 
 ## Overall Status
 
-Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestone 4 harness landed and verified locally. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
+Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestone 4 done (CI green and enforced on a protected, public `main`). Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
 
 Current focus:
 
 ```txt
-Milestone 4: CI and Integration Test Harness (verified locally; pending first green run + branch protection on GitHub)
-→ next: Milestone 5: Correctness Under Failure
+Milestone 5: Correctness Under Failure
+slice A (transactional outbox) — in progress
+next slices: B leases+reaper · C retries/DLQ · D idempotency+shutdown
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -23,8 +24,8 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
-| 4. CI and Integration Test Harness | In progress | GitHub Actions workflow + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow) written and verified locally. Remaining: first green run on GitHub + mark CI required for PRs (branch protection). ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
-| 5. Correctness Under Failure | Not started | Transactional outbox, job leases + reaper, retries/backoff/DLQ, idempotency, graceful shutdown. |
+| 4. CI and Integration Test Harness | Done | GitHub Actions + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow). CI green on PR #1 and required via a ruleset on a public, protected `main`. ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
+| 5. Correctness Under Failure | In progress | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms. ADR `docs/adr/0002-transactional-outbox.md`. Remaining: leases+reaper, retries/DLQ, idempotency, graceful shutdown. |
 | 6. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
 | 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
 | 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
@@ -131,11 +132,11 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 
 ### Milestone 5: Correctness Under Failure
 
-- [ ] Add migration `000002`: `outbox_messages` table
-- [ ] Add migration `000002`: `video_jobs.claimed_by` and `video_jobs.lease_expires_at`
-- [ ] Write video + job + outbox row in one DB transaction in `Upload`
-- [ ] Remove direct RabbitMQ publish from the upload request path
-- [ ] Add outbox relay loop in API (`FOR UPDATE SKIP LOCKED`, publisher confirms)
+- [x] Add migration `000002`: `outbox_messages` table
+- [ ] Add migration `000003`: `video_jobs.claimed_by` and `video_jobs.lease_expires_at` (slice B)
+- [x] Write video + job + outbox row in one DB transaction in `Upload`
+- [x] Remove direct RabbitMQ publish from the upload request path
+- [x] Add outbox relay loop in API (`FOR UPDATE SKIP LOCKED`, publisher confirms)
 - [ ] Increment `video_jobs.attempts` on every claim
 - [ ] Add worker heartbeat that extends the lease during processing
 - [ ] Add reaper: expired lease below max attempts → requeue via outbox

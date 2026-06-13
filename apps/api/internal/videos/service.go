@@ -2,6 +2,7 @@ package videos
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"time"
@@ -12,16 +13,14 @@ import (
 type Service struct {
 	repo           Repository
 	storage        ObjectStorage
-	publisher      JobPublisher
 	rawBucket      string
 	maxUploadBytes int64
 }
 
-func NewService(repo Repository, storage ObjectStorage, publisher JobPublisher, rawBucket string, maxUploadBytes int64) *Service {
+func NewService(repo Repository, storage ObjectStorage, rawBucket string, maxUploadBytes int64) *Service {
 	return &Service{
 		repo:           repo,
 		storage:        storage,
-		publisher:      publisher,
 		rawBucket:      rawBucket,
 		maxUploadBytes: maxUploadBytes,
 	}
@@ -50,26 +49,33 @@ func (s *Service) Upload(ctx context.Context, params UploadParams) (Video, error
 		return Video{}, err
 	}
 
-	video, err := s.repo.CreateQueuedVideo(ctx, CreateQueuedVideoParams{
-		VideoID:          videoID,
-		JobID:            jobID,
-		Title:            title,
-		Description:      description,
-		RawObjectKey:     rawKey,
-		OriginalFilename: params.OriginalFilename,
-		ContentType:      params.ContentType,
-		SizeBytes:        params.SizeBytes,
-	})
-	if err != nil {
-		return Video{}, err
-	}
-
-	err = s.publisher.PublishTranscode(ctx, TranscodeJob{
+	// Build the transcode job and hand it to the repository as an outbox row.
+	// The video, job, and outbox message are committed in one transaction; the
+	// API never publishes to RabbitMQ on the request path (no dual-write). The
+	// relay loop delivers it.
+	payload, err := json.Marshal(TranscodeJob{
 		JobID:        jobID,
 		VideoID:      videoID,
 		RawBucket:    s.rawBucket,
 		RawObjectKey: rawKey,
 		RequestedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return Video{}, err
+	}
+
+	video, err := s.repo.CreateQueuedVideo(ctx, CreateQueuedVideoParams{
+		VideoID:           videoID,
+		JobID:             jobID,
+		Title:             title,
+		Description:       description,
+		RawObjectKey:      rawKey,
+		OriginalFilename:  params.OriginalFilename,
+		ContentType:       params.ContentType,
+		SizeBytes:         params.SizeBytes,
+		OutboxExchange:    VideoExchange,
+		OutboxRoutingKey:  TranscodeRoutingKey,
+		OutboxPayloadJSON: payload,
 	})
 	if err != nil {
 		return Video{}, err

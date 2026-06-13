@@ -4,25 +4,23 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/minio/minio-go/v7"
 	"mediaflow/apps/api/internal/database"
-	"mediaflow/apps/api/internal/queue"
 	"mediaflow/apps/api/internal/storage"
 	"mediaflow/apps/api/internal/videos"
 )
 
-// TestUploadStoresQueuesAndPublishes drives the real upload service against
-// live Postgres, MinIO, and RabbitMQ: the raw object lands in storage, the
-// video row is queued, and a transcode job is published — the store→queue half
-// of the pipeline.
-func TestUploadStoresQueuesAndPublishes(t *testing.T) {
+// TestUploadStoresAndWritesOutbox drives the real upload service against live
+// MinIO + Postgres: the raw object lands in storage and the transcode job is
+// written to the outbox in the same transaction as the video — and critically,
+// the upload path never touches RabbitMQ (no broker is involved here at all).
+func TestUploadStoresAndWritesOutbox(t *testing.T) {
 	db := openDB(t)
 	truncateAll(t, db)
-	drainTranscodeQueue(t)
 	ctx := context.Background()
 
 	repo := database.NewPostgresRepository(db)
@@ -33,13 +31,8 @@ func TestUploadStoresQueuesAndPublishes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new minio storage: %v", err)
 	}
-	publisher, err := queue.NewRabbitPublisher(infra.rabbitURL)
-	if err != nil {
-		t.Fatalf("new publisher: %v", err)
-	}
-	t.Cleanup(func() { _ = publisher.Close() })
 
-	service := videos.NewService(repo, objStore, publisher, rawBucket, 0)
+	service := videos.NewService(repo, objStore, rawBucket, 0)
 
 	contents := "fake mp4 bytes for integration"
 	created, err := service.Upload(ctx, videos.UploadParams{
@@ -76,12 +69,32 @@ func TestUploadStoresQueuesAndPublishes(t *testing.T) {
 		t.Fatalf("expected raw object size %d, got %d", len(contents), stat.Size)
 	}
 
-	// Transcode job published for this video.
-	job := consumeOneTranscodeJob(t, 10*time.Second)
-	if job.VideoID != created.ID {
-		t.Fatalf("expected published job for video %s, got %s", created.ID, job.VideoID)
+	// Exactly one unpublished outbox row, carrying the transcode job for this video.
+	var (
+		exchange   string
+		routingKey string
+		payload    []byte
+		published  *string
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT exchange, routing_key, payload_json, published_at::text
+		FROM outbox_messages
+	`).Scan(&exchange, &routingKey, &payload, &published)
+	if err != nil {
+		t.Fatalf("read outbox row: %v", err)
 	}
-	if job.RawObjectKey != *stored.RawObjectKey {
-		t.Fatalf("published job key %q does not match stored key %q", job.RawObjectKey, *stored.RawObjectKey)
+	if published != nil {
+		t.Fatalf("expected unpublished outbox row, got published_at=%v", *published)
+	}
+	if exchange != videos.VideoExchange || routingKey != videos.TranscodeRoutingKey {
+		t.Fatalf("unexpected outbox routing: %s/%s", exchange, routingKey)
+	}
+
+	var job videos.TranscodeJob
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatalf("decode outbox payload: %v", err)
+	}
+	if job.VideoID != created.ID || job.RawObjectKey != *stored.RawObjectKey {
+		t.Fatalf("outbox job does not match video: %#v", job)
 	}
 }

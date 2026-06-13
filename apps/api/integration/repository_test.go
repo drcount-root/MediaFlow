@@ -22,14 +22,17 @@ func TestRepositoryCreateQueuedVideoPersistsRows(t *testing.T) {
 	description := "an integration video"
 
 	created, err := repo.CreateQueuedVideo(ctx, videos.CreateQueuedVideoParams{
-		VideoID:          videoID,
-		JobID:            jobID,
-		Title:            "Integration Title",
-		Description:      &description,
-		RawObjectKey:     "raw-videos/" + videoID + "/original.mp4",
-		OriginalFilename: "clip.mp4",
-		ContentType:      "video/mp4",
-		SizeBytes:        2048,
+		VideoID:           videoID,
+		JobID:             jobID,
+		Title:             "Integration Title",
+		Description:       &description,
+		RawObjectKey:      "raw-videos/" + videoID + "/original.mp4",
+		OriginalFilename:  "clip.mp4",
+		ContentType:       "video/mp4",
+		SizeBytes:         2048,
+		OutboxExchange:    videos.VideoExchange,
+		OutboxRoutingKey:  videos.TranscodeRoutingKey,
+		OutboxPayloadJSON: []byte(`{"videoId":"` + videoID + `"}`),
 	})
 	if err != nil {
 		t.Fatalf("CreateQueuedVideo: %v", err)
@@ -92,13 +95,16 @@ func TestRepositoryListAndVariantsReflectStoredData(t *testing.T) {
 
 	videoID := uuid.NewString()
 	if _, err := repo.CreateQueuedVideo(ctx, videos.CreateQueuedVideoParams{
-		VideoID:          videoID,
-		JobID:            uuid.NewString(),
-		Title:            "Listed",
-		RawObjectKey:     "raw-videos/" + videoID + "/original.mp4",
-		OriginalFilename: "clip.mp4",
-		ContentType:      "video/mp4",
-		SizeBytes:        1,
+		VideoID:           videoID,
+		JobID:             uuid.NewString(),
+		Title:             "Listed",
+		RawObjectKey:      "raw-videos/" + videoID + "/original.mp4",
+		OriginalFilename:  "clip.mp4",
+		ContentType:       "video/mp4",
+		SizeBytes:         1,
+		OutboxExchange:    videos.VideoExchange,
+		OutboxRoutingKey:  videos.TranscodeRoutingKey,
+		OutboxPayloadJSON: []byte(`{"videoId":"` + videoID + `"}`),
 	}); err != nil {
 		t.Fatalf("CreateQueuedVideo: %v", err)
 	}

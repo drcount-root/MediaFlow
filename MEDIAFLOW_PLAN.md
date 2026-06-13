@@ -530,6 +530,201 @@ Multi-tenancy turns every earlier system into a harder version of itself.
 
 ---
 
+## Milestone 13: Video Understanding Layer (Phase 3)
+
+Turn the transcode fan-out into an *enrichment* fan-out: every upload also
+becomes searchable, chaptered, and captioned. The point is twofold — it makes
+the product feel like 2025 instead of 2010, and it proves the M7 job system is
+**general** (ML work is just more job types, not a special case). Depends on M7
+(fan-out) and reuses M11's player surface.
+
+### Design — enrichment as fan-out jobs
+
+- Extend the M7 job hierarchy with two new `job_type`s alongside `rendition`:
+  `transcript` and `embedding`. The **planner** fans these out via the outbox at
+  the same time as renditions.
+- **Non-blocking by design**: a video still reaches `ready` when *transcoding*
+  finishes — enrichment runs in parallel and populates search/chapters/captions
+  when done. A separate `enrichment_status` (`pending → indexing → indexed`)
+  tracks it. **ML failure degrades, never blocks**: a failed transcript means no
+  captions for that video, not a `failed` video. (Engineering rule: no video is
+  ever stuck — enrichment is off the critical path.)
+- **Transcript job**: extract audio, run Whisper (whisper.cpp locally, or a
+  hosted endpoint). Output timestamped segments → a WebVTT file under
+  `processed-videos/{videoId}/subtitles/` (wired as an HLS `EXT-X-MEDIA` subtitle
+  track — subsumes the optional "subtitles via Whisper" extension) plus rows in
+  `video_transcripts(video_id, start_s, end_s, text)`.
+- **Auto-chapters**: feed the transcript to an LLM (Claude) to segment it into
+  titled chapters; store in `video_chapters(video_id, start_s, title)`. The
+  player renders chapter markers on the seek bar (alongside M11 storyboards).
+- **Embedding job**: sample frames (~1 per 2s, drop near-duplicates), embed them
+  (CLIP or a hosted multimodal model); also embed each transcript segment. Store
+  vectors in **pgvector** — keeps everything in Postgres, no new datastore — in
+  `video_embeddings(video_id, kind, ref_s, embedding)`.
+- **Auto-thumbnail upgrade**: pick the most representative frame by embedding
+  centrality instead of the fixed frame-at-1s.
+- **Semantic search**: `GET /search?q=...` embeds the query, runs vector
+  similarity over transcript + frame embeddings, returns ranked hits as
+  `{videoId, timestamp, snippet}`. Web: a search box; a result deep-links to
+  `/watch/:id?t=SECONDS` and seeks to the moment.
+- New migration `000005_*` (or per build order): the four tables above + the
+  `pgvector` extension + enrichment job rows. Env: model endpoints/keys.
+- ADR: ML-as-a-job-type; pgvector vs a dedicated vector DB; why enrichment is
+  non-blocking and degradation-tolerant.
+
+### Done when
+
+- Upload a video → shortly after `ready` it has captions, titled chapters, and
+  is searchable, with a representative auto-thumbnail.
+- A natural-language query (`"the part about the outage"`) jumps to the exact
+  second, across the whole library.
+- Killing the embedding model mid-run leaves the video playable with degraded
+  features — never stuck, never `failed` for an ML reason.
+
+## Milestone 14: Mission Control — Live Fleet Dashboard + Chaos Controls (Showcase)
+
+The demo centerpiece. Make the distributed system **visible and pokeable**: a
+live view of every worker and what it's processing, plus a button to *kill nodes
+from the UI* and watch the system recover without losing a single video — the
+"go ahead, kill it, I don't care" moment. This milestone mostly **surfaces infra
+you already built** (M5 leases/reaper, M7 fan-out, M8 SSE, M9 heartbeats/metrics)
+— which is exactly why it's a credible showcase: the resilience is real, not
+staged. Build it after those dependencies land.
+
+### Design — fleet state
+
+- Each worker registers and heartbeats its live state (extends the M5 lease
+  heartbeat and M9 metrics): `workers(worker_id, host, pid, status, current_job,
+  current_video, stage, progress_pct, started_at, last_heartbeat_at)`, mirrored
+  into a Redis hash for fast reads. `status` ∈ `idle | processing | draining`;
+  `stage` ∈ `download | probe | transcode | upload | finalize`. The M5 reaper
+  already declares a worker dead when its heartbeat/lease goes stale.
+- **Fleet API**: `GET /admin/fleet` (live workers + per-worker current work +
+  queue depth + in-flight count + time-to-ready stats) and
+  `GET /admin/fleet/events` (SSE stream of fleet changes — reuses M8's SSE
+  machinery and `video_events`/Redis pub-sub).
+
+### Design — the chaos control plane (the kill switch)
+
+- `POST /admin/workers/:id/{pause|resume}` → control message on a Redis channel
+  the workers subscribe to (graceful drain — safe).
+- `POST /admin/workers/:id/kill` → a **hard** `kill -9`-equivalent for the demo:
+  a thin supervisor invokes the container runtime (`docker kill` via the Docker
+  socket locally; the pod-delete API under the k8s capstone) to terminate that
+  worker outright. This is the honest version — no in-process "pretend crash".
+- **Gated**: the entire chaos plane requires `CHAOS_MODE=true` **and** admin auth
+  (M12). It is demo-only and must be impossible to trigger in a real deployment.
+- Optional flourish: **chaos roulette** — a toggle that kills a random worker
+  every N seconds for a hands-free resilience loop.
+
+### Design — the visualization (web `/mission-control`)
+
+- A grid of **worker cards**: each shows the worker, its current video + stage,
+  a live progress bar, pulsing while active; a red **KILL** button per card.
+- Live **queue-depth gauge**, in-flight count, and a rolling time-to-ready stat.
+- A **per-video pipeline view**: the M7 fan-out renditions as parallel lanes
+  filling up, so you can see one video's work spread across the fleet.
+- The payoff interaction: click **KILL** on a worker mid-transcode → its card
+  drops out → the UI then *animates the recovery* — lease expires, reaper
+  requeues the orphaned rendition, a surviving worker picks it up, the video
+  still reaches `ready`. A scoreboard tallies "workers killed" vs "videos
+  completed: 100%".
+- ADR: control-plane safety (`CHAOS_MODE` gating + authz), how hard-kill is
+  implemented per environment (Docker socket / k8s API), and DB-vs-Redis for
+  fleet state.
+
+### Done when
+
+- The dashboard shows every live worker, its stage, and live progress, updating
+  over SSE with no polling.
+- Clicking KILL hard-kills a worker mid-job; the UI shows lease expiry → reaper
+  requeue → resume on another worker → `ready`, with **zero stuck videos**.
+- Chaos roulette can run for several minutes while 100% of in-flight videos
+  still complete — the resilience claim, demonstrated live.
+
+---
+
+## Milestone 15: Content-Aware Encoding + Quality/Cost Proof (Showcase)
+
+Stop shipping a fixed bitrate ladder. Analyze each source, encode the *optimal*
+ladder for that content, and **prove it with numbers** — VMAF perceptual quality
+and a real cost meter. This is the "we understand the economics of video, not
+just how to play it" milestone, and the one that signals depth to anyone who has
+operated video at scale. Builds on M7 (the planner already decides the ladder).
+
+### Design
+
+- **Complexity analysis** in the planner stage: estimate how hard the source is
+  to compress (a fast constant-quality probe encode, or spatial/temporal energy
+  from ffprobe/`signalstats`). Talking-head footage is cheap; high-motion sport
+  is expensive — and the ladder should reflect that.
+- **Per-title bitrate ladder**: derive the rendition set and target bitrates from
+  complexity instead of the fixed 360/480/720 @ fixed bitrates (still capped by
+  source resolution). Simple content → fewer/leaner rungs; complex content →
+  richer ladder. Reference: Netflix per-title / per-shot encoding and the
+  convex-hull bitrate–resolution selection — document the rigorous version,
+  implement a pragmatic one.
+- **VMAF scoring**: after each rendition, compute VMAF (an ffmpeg built with
+  `libvmaf`) of the rendition against the source. Store per-rendition VMAF and
+  measured bitrate on `video_variants` (new columns) — the quality-vs-bitrate
+  datapoint.
+- **Cost meter**: track transcode CPU-seconds per video and per rendition, times
+  a configurable `COST_PER_CPU_HOUR`; store and expose. Dashboard tiles: `$ / 1000
+  videos`, `bytes / minute of video`, and a CAE-vs-fixed-ladder comparison.
+- **The proof**: a measurement (under `tests/encoding/`) that runs the fixed
+  ladder vs CAE over the same corpus and reports bytes saved at equal VMAF and
+  the resulting cost delta. That single number is the headline.
+- Migration: VMAF + bitrate + cost columns on variants (and/or a
+  `video_encode_stats` table). ADR: per-title approach chosen, VMAF as the
+  quality gate, and the cost-model assumptions.
+
+### Done when
+
+- For a representative corpus, CAE ships measurably fewer bytes than the fixed
+  ladder at equal-or-better VMAF, with the savings and cost delta committed
+  (e.g. "~35% fewer bytes at VMAF ≥ 93, ~Y% cheaper per 1000 videos").
+- Every rendition has a stored VMAF score and bitrate; the dashboard renders the
+  quality-vs-bitrate curve.
+- A high-motion source gets a richer ladder and a simple one gets a leaner
+  ladder — the decision is content-driven and visible, not hardcoded.
+
+## Milestone 16: Auto-Trailer / Highlight Reel (Showcase)
+
+Turn the understanding layer into a *creative output*: auto-generate a short,
+shareable trailer from any upload. The most screenshot-able feature on the
+roadmap, and nearly free once M13 exists — it's another non-blocking enrichment
+job. Depends on M13 (transcript + embeddings).
+
+### Design
+
+- New `highlight` enrichment `job_type` (M7/M13 fan-out), non-blocking like the
+  rest of M13 — trailer generation never gates `ready`.
+- **Moment scoring** from signals you already produce: an LLM (Claude) picks the
+  most informative/quotable transcript lines with timestamps; audio energy peaks;
+  scene-change density; frame-embedding salience and visual diversity. Combine
+  into a score per time window.
+- **Selection + assembly**: choose the top K non-overlapping windows totaling
+  ~20–30s, kept in chronological order; FFmpeg trims and concatenates them into a
+  trailer, which is then run through the **same HLS pipeline** (a trailer is just
+  another short video — this proves the pipeline composes). Output under
+  `processed-videos/{videoId}/trailer/`.
+- **Hover previews**: also emit an animated preview (GIF/WebP) and reuse the M13
+  representative thumbnail; the web grid plays the trailer/preview on hover
+  (the YouTube/Netflix interaction), with a "trailer" badge and a share button.
+- ADR: heuristic vs LLM-driven moment selection; non-blocking enrichment; reusing
+  the transcode pipeline for a generated artifact.
+
+### Done when
+
+- Upload a multi-minute video → shortly after `ready`, a ~30s auto-trailer exists
+  and plays on hover in the grid.
+- The trailer spans visually and topically distinct moments (driven by transcript
+  + embedding signals), not just the first 30 seconds.
+- Trailer generation failing degrades gracefully (no trailer) and never blocks
+  `ready` or wedges the pipeline.
+
+---
+
 ## Phase 4: Capstone Options
 
 Commit to these only after M10 proves the foundation. Each is a project-sized
@@ -546,10 +741,18 @@ effort; pick by interest.
 
 ## Optional Extensions (pick by interest, any time after M10)
 
-- **Subtitles via Whisper** — a transcription job type through the same
-  pipeline (proves the job system is general); HLS native subtitle tracks.
+- **Subtitles via Whisper** — now folded into M13 (the transcript job produces
+  the WebVTT subtitle track); listed here only for historical context.
 - **HLS AES-128 encryption** — segment encryption with an auth-gated key
   endpoint (`EXT-X-KEY`); natural extension of M8's signing work.
+- **ABR visualizer** (player extension, after M8) — a network-throttle slider on
+  the watch page with a live bandwidth/buffer graph, showing hls.js switching
+  renditions in real time. Makes adaptive streaming visible and pokeable for
+  almost no effort.
+- **Clip-it sharing** (player extension, after M8) — drag-select a time range and
+  get a shareable URL that plays just that span via a generated sub-playlist over
+  existing segments (no re-encode), with its own thumbnail. The Twitch/YouTube
+  "clip" feature, built from your own primitives and M8's signing.
 
 Deliberately out of scope: recommendations/ML, microservice splitting for its
 own sake, GraphQL, comments/likes (CRUD, not system design).
@@ -570,6 +773,10 @@ polish, proof before product features:
 7. M10: SLOs → load tests → chaos suite → DR drill → postmortems → final docs.
 8. M11: heartbeat ingest → stream aggregator → analytics UI → storyboards.
 9. M12: auth → quotas → rate limits → fair scheduling drill.
+10. M13: enrichment job types → transcript/embedding workers → pgvector → search UI (after M7; uses M11 player).
+11. M14: worker heartbeat state → fleet API + SSE → chaos control plane → Mission Control UI (after M5/M7/M8/M9).
+12. M15: complexity analysis → per-title ladder → VMAF scoring → cost meter → fixed-vs-CAE measurement (after M7).
+13. M16: highlight-scoring job → trailer assembly through the HLS pipeline → hover previews (after M13).
 
 Each milestone lands with tests, a `PROGRESS.md` update, an ADR when it makes
 an architectural decision, and migrations under `infrastructure/migrations/`
@@ -585,6 +792,10 @@ M8:  PLAYBACK_HMAC_SECRET, EDGE_BASE_URL, REDIS_ADDR (finally used)
 M9:  OTEL_EXPORTER_OTLP_ENDPOINT, METRICS_ADDR
 M11: ANALYTICS_STREAM_NAME, ANALYTICS_FLUSH_INTERVAL
 M12: JWT_SECRET, ACCESS_TOKEN_TTL
+M13: WHISPER_ENDPOINT, EMBEDDING_ENDPOINT, ANTHROPIC_API_KEY (auto-chapters), PGVECTOR enabled
+M14: CHAOS_MODE, DOCKER_HOST (supervisor access to the container runtime)
+M15: COST_PER_CPU_HOUR (cost meter); requires an ffmpeg built with libvmaf
+M16: TRAILER_TARGET_SECONDS
 ```
 
 Keep `.env.example` files current when these land.

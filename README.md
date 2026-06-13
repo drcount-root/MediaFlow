@@ -2,6 +2,10 @@
 
 MediaFlow is a YouTube-like video upload and adaptive streaming project. The MVP uploads MP4 videos, queues processing work, transcodes with FFmpeg, stores HLS output, and plays streams with `hls.js`.
 
+**New here? Follow [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md)** for a step-by-step
+guide to running the full pipeline locally (infra → API → worker → web → upload
+and play a video).
+
 Read [MEDIAFLOW_PLAN.md](MEDIAFLOW_PLAN.md) for the implementation plan and [PROGRESS.md](PROGRESS.md) for current status.
 
 ## Planned Layout
@@ -54,6 +58,24 @@ go run ./cmd/migrate
 ```
 
 Docker Compose also applies the initial schema on first Postgres volume creation.
+
+## CI and Integration Tests
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and PR: API and
+worker `gofmt`/`go vet`/`go test`, web `lint`/`build`, and the integration suites.
+See `docs/adr/0001-ci-and-integration-harness.md` for the design.
+
+Integration tests are gated behind the `integration` build tag and use
+[testcontainers-go] to spin up real Postgres, RabbitMQ, and MinIO. They need a
+running Docker daemon (and `ffmpeg`/`ffprobe` on `PATH` for the worker pipeline
+test, which skips when those are absent). Run them per module, exactly as CI does:
+
+```bash
+cd apps/api    && go test -tags integration ./...
+cd apps/worker && go test -tags integration ./...
+```
+
+[testcontainers-go]: https://golang.testcontainers.org/
 
 ## API
 
@@ -126,4 +148,4 @@ npm run build
 
 ## Current Status
 
-Phase 1 (Milestones 0–3, the MVP pipeline) is complete. Phase 2 turns MediaFlow into a hardcore distributed-systems project — Milestones 4–10 cover CI with real-dependency integration tests, failure correctness (outbox, leases, retries, DLQ), presigned multipart uploads, distributed fan-out transcoding, signed manifests behind an edge cache with SSE status push, observability, and load/chaos/disaster-recovery drills. Phase 3 (Milestones 11–12) adds a watch-time analytics pipeline, storyboard seek previews, auth, quotas, and fair scheduling. The next focus is Milestone 4: CI and Integration Test Harness.
+Phase 1 (Milestones 0–3, the MVP pipeline) is complete. Phase 2 turns MediaFlow into a hardcore distributed-systems project — Milestones 4–10 cover CI with real-dependency integration tests, failure correctness (outbox, leases, retries, DLQ), presigned multipart uploads, distributed fan-out transcoding, signed manifests behind an edge cache with SSE status push, observability, and load/chaos/disaster-recovery drills. Phase 3 (Milestones 11–12) adds a watch-time analytics pipeline, storyboard seek previews, auth, quotas, and fair scheduling. Milestone 4 (CI + integration harness) is in place and verified locally; the next focus is Milestone 5: Correctness Under Failure.

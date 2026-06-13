@@ -1,15 +1,16 @@
 # MediaFlow Progress Tracker
 
-Last updated: 2026-06-12
+Last updated: 2026-06-13
 
 ## Overall Status
 
-Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) not started. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
+Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestone 4 harness landed and verified locally. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
 
 Current focus:
 
 ```txt
-Milestone 4: CI and Integration Test Harness
+Milestone 4: CI and Integration Test Harness (verified locally; pending first green run + branch protection on GitHub)
+→ next: Milestone 5: Correctness Under Failure
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -22,7 +23,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 1. API Upload Path | Done | Upload path, DB writes, MinIO storage, RabbitMQ publishing, list/detail/playback endpoints, migration command, and API tests are working. |
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
-| 4. CI and Integration Test Harness | Not started | GitHub Actions; testcontainers-go integration tests against real Postgres/RabbitMQ/MinIO. |
+| 4. CI and Integration Test Harness | In progress | GitHub Actions workflow + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow) written and verified locally. Remaining: first green run on GitHub + mark CI required for PRs (branch protection). ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
 | 5. Correctness Under Failure | Not started | Transactional outbox, job leases + reaper, retries/backoff/DLQ, idempotency, graceful shutdown. |
 | 6. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
 | 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
@@ -31,6 +32,10 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 10. Proof: SLOs, Load, Chaos, DR | Not started | Stated SLOs, k6 load tests, scripted chaos scenarios, PITR restore drill, postmortems, ADRs. |
 | 11. Analytics and Player Intelligence | Not started | Watch-time heartbeat pipeline via Redis Streams, retention curves, HLL unique views, storyboard seek previews. |
 | 12. Auth, Quotas, Fair Scheduling | Not started | JWT auth, per-user quotas and rate limits, per-tenant fair dispatch. |
+| 13. Video Understanding Layer | Not started | Enrichment fan-out: Whisper transcripts/captions, LLM auto-chapters, frame+text embeddings in pgvector, semantic search. Non-blocking; depends on M7. |
+| 14. Mission Control (Showcase) | Not started | Live worker-fleet dashboard over SSE + chaos kill controls (kill nodes from the UI, watch recovery). Surfaces M5/M7/M8/M9. |
+| 15. Content-Aware Encoding (Showcase) | Not started | Per-title bitrate ladder from complexity analysis, VMAF scoring, cost meter; proves fewer bytes at equal quality. Depends on M7. |
+| 16. Auto-Trailer (Showcase) | Not started | Non-blocking `highlight` enrichment job: score moments, assemble a ~30s trailer through the HLS pipeline, hover previews. Depends on M13. |
 | Phase 4 Capstone | Not started | Live streaming and/or Kubernetes + cloud — pick after Milestone 10. |
 
 ## Detailed Checklist
@@ -112,17 +117,17 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 
 ### Milestone 4: CI and Integration Test Harness
 
-- [ ] GitHub Actions workflow: API `gofmt` check, `go vet`, `go test ./...`
-- [ ] GitHub Actions workflow: worker tests with ffmpeg/ffprobe installed in runner
-- [ ] GitHub Actions workflow: web `npm run lint` and `npm run build`
-- [ ] Go module and npm dependency caching in CI
-- [ ] Integration test suite behind `integration` build tag using testcontainers-go
-- [ ] Integration: repository tests against real Postgres with migrations applied
-- [ ] Integration: publish/consume round-trip against real RabbitMQ
-- [ ] Integration: upload → store → queue → process flow with generated fixture MP4
-- [ ] Fixture MP4 generated via ffmpeg in tests (never committed)
-- [ ] Local command mirrors CI (`go test -tags integration ./...`)
-- [ ] CI required for PRs; main branch green
+- [x] GitHub Actions workflow: API `gofmt` check, `go vet`, `go test ./...`
+- [x] GitHub Actions workflow: worker tests with ffmpeg/ffprobe installed in runner
+- [x] GitHub Actions workflow: web `npm run lint` and `npm run build`
+- [x] Go module and npm dependency caching in CI (`setup-go`/`setup-node` cache)
+- [x] Integration test suite behind `integration` build tag using testcontainers-go
+- [x] Integration: repository tests against real Postgres with migrations applied
+- [x] Integration: publish/consume round-trip against real RabbitMQ
+- [x] Integration: upload → store → queue → process flow with generated fixture MP4
+- [x] Fixture MP4 generated via ffmpeg in tests (never committed)
+- [x] Local command mirrors CI (`go test -tags integration ./...`)
+- [ ] CI required for PRs; main branch green (needs first push + branch-protection rule on GitHub)
 
 ### Milestone 5: Correctness Under Failure
 
@@ -267,6 +272,61 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 - [ ] Fairness drill: tenant A enqueues 50 videos, tenant B enqueues 1; B completes in ~single-tenant time
 - [ ] Tests: authz, quota enforcement, rate limits, dispatcher fairness
 
+### Milestone 13: Video Understanding Layer
+
+- [ ] Add migration `000005+`: enable `pgvector`; `video_transcripts`, `video_chapters`, `video_embeddings` tables; `enrichment_status` + enrichment job rows
+- [ ] Extend M7 job hierarchy with `transcript` and `embedding` job types; planner fans them out via the outbox
+- [ ] Enrichment is non-blocking: video reaches `ready` on transcode completion; ML failure degrades, never fails/wedges the video
+- [ ] Transcript job: audio extract → Whisper → timestamped segments → WebVTT subtitle track (`EXT-X-MEDIA`) + DB rows
+- [ ] Auto-chapters: LLM (Claude) segments transcript into titled chapters; rendered as seek-bar markers
+- [ ] Embedding job: sample/dedup frames + transcript segments → CLIP/multimodal embeddings → pgvector
+- [ ] Auto-thumbnail upgrade: pick representative frame by embedding centrality
+- [ ] `GET /search?q=...`: embed query → vector similarity → ranked `{videoId, timestamp, snippet}` hits
+- [ ] Web: search box; result deep-links to `/watch/:id?t=SECONDS` and seeks
+- [ ] ADR: ML-as-a-job-type; pgvector vs dedicated vector DB; non-blocking/degradation design
+- [ ] Tests: enrichment job parsing, search ranking, degradation when a model is unavailable
+- [ ] Verify: upload → captions + chapters + searchable; NL query jumps to the right second
+
+### Milestone 14: Mission Control — Live Fleet Dashboard + Chaos Controls
+
+- [ ] Worker heartbeat state: `workers` table (+ Redis mirror) with status, current job/video, stage, progress, last heartbeat
+- [ ] `GET /admin/fleet`: live workers + current work + queue depth + in-flight + time-to-ready stats
+- [ ] `GET /admin/fleet/events`: SSE stream of fleet changes (reuses M8 SSE)
+- [ ] `POST /admin/workers/:id/pause|resume`: graceful drain via Redis control channel
+- [ ] `POST /admin/workers/:id/kill`: hard kill via container runtime (`docker kill` / k8s pod delete) through a thin supervisor
+- [ ] Gate the entire chaos plane behind `CHAOS_MODE=true` + admin auth (M12); impossible in real deployments
+- [ ] Optional: chaos roulette — kill a random worker every N seconds
+- [ ] Web `/mission-control`: worker cards with live stage + progress + per-card KILL button
+- [ ] Web: queue-depth gauge, in-flight count, rolling time-to-ready, per-video fan-out lanes
+- [ ] Web: animate recovery after a kill (lease expiry → reaper requeue → resume → ready); killed-vs-completed scoreboard
+- [ ] ADR: control-plane safety/gating; hard-kill implementation per environment; DB-vs-Redis fleet state
+- [ ] Verify: KILL mid-job → UI shows full recovery, zero stuck videos
+- [ ] Verify: chaos roulette runs for minutes with 100% of in-flight videos still completing
+
+### Milestone 15: Content-Aware Encoding + Quality/Cost Proof
+
+- [ ] Complexity analysis in the planner (fast CQ probe encode or `signalstats` energy)
+- [ ] Per-title bitrate ladder derived from complexity (capped by source resolution), replacing the fixed ladder
+- [ ] VMAF scoring per rendition (ffmpeg + libvmaf) of rendition vs source
+- [ ] Add migration: VMAF + measured-bitrate + cost columns on `video_variants` (and/or `video_encode_stats`)
+- [ ] Cost meter: track transcode CPU-seconds per video/rendition × `COST_PER_CPU_HOUR`
+- [ ] Dashboard tiles: `$ / 1000 videos`, `bytes / minute`, CAE-vs-fixed comparison, quality-vs-bitrate curve
+- [ ] Measurement under `tests/encoding/`: fixed ladder vs CAE on a corpus → bytes saved at equal VMAF + cost delta
+- [ ] ADR: per-title approach, VMAF quality gate, cost-model assumptions
+- [ ] Verify: CAE ships fewer bytes at equal-or-better VMAF; high-motion gets richer ladder, simple gets leaner
+
+### Milestone 16: Auto-Trailer / Highlight Reel
+
+- [ ] New non-blocking `highlight` enrichment job type (M7/M13 fan-out)
+- [ ] Moment scoring: LLM transcript keypoints + audio energy + scene changes + frame-embedding salience/diversity
+- [ ] Selection: top K non-overlapping ~20–30s windows in chronological order
+- [ ] Assembly: FFmpeg trim+concat → run the trailer back through the HLS pipeline (`processed-videos/{videoId}/trailer/`)
+- [ ] Animated hover preview (GIF/WebP) + representative thumbnail reuse
+- [ ] Web: grid plays trailer/preview on hover, "trailer" badge, share button
+- [ ] ADR: heuristic vs LLM moment selection; non-blocking enrichment; reusing the transcode pipeline
+- [ ] Tests: moment selection, graceful degradation when generation fails
+- [ ] Verify: multi-minute upload → ~30s trailer spanning distinct moments; failure never blocks `ready`
+
 ### Phase 4 Capstone (pick after Milestone 10)
 
 - [ ] Decide: live streaming vs Kubernetes/cloud first (ADR)
@@ -292,6 +352,10 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | Playback (M8) | API manifest rewriting + HMAC-signed segment URLs behind nginx edge cache |
 | Realtime status (M8) | SSE over Redis pub/sub with `video_events` replay; polling fallback |
 | Analytics ingest (M11) | Redis Streams + consumer groups; Kafka documented as scale-up path |
+| Video understanding (M13) | Enrichment as extra fan-out job types; vectors in pgvector (no new datastore); non-blocking so ML failures degrade, never wedge a video |
+| Chaos controls (M14) | Hard kill via container runtime through a supervisor; entire chaos plane gated behind `CHAOS_MODE` + admin auth |
+| Encoding (M15) | Per-title (content-aware) bitrate ladder; VMAF as the quality gate; savings proven by a fixed-vs-CAE measurement, not claimed |
+| Auto-trailer (M16) | A `highlight` enrichment job; trailer is assembled then re-run through the existing HLS pipeline (proves the pipeline composes) |
 | SQL access | `database/sql` + pgx, no ORM |
 
 ## Open Questions

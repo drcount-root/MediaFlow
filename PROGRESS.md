@@ -149,7 +149,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 - [ ] Add graceful worker shutdown (finish in-flight job on SIGTERM)
 - [ ] Write `video_events` row on every status transition
 - [ ] Tests (incl. integration): outbox relay, claim/lease, retry routing, reaper, idempotency key
-- [ ] Failure drill: `kill -9` worker mid-job → reaper recovers → video `ready`
+- [x] Failure drill: `kill -9` worker mid-job → reaper recovers → video `ready` (2026-06-13: two-worker run, killed the claimer mid-download with the lease held; the survivor's reaper logged `requeued=1` ~16s later, reclaimed as attempt 2, drove the video to `ready`; `video.job.requeued` event recorded and the requeue flowed through the outbox)
 - [ ] Failure drill: RabbitMQ down during upload → outbox drains after restart
 - [ ] Failure drill: poison message lands in DLQ without wedging the consumer
 

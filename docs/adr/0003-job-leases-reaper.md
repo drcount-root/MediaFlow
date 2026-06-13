@@ -81,6 +81,11 @@ brief GC pause or slow tick never lets a live worker's lease lapse.
   non-owning-worker no-op), `TestReaperRequeuesExpiredLeaseBelowMax` (asserts the
   outbox row, event, and cleared claim), `TestReaperFailsAtMaxAttempts` (asserts
   no outbox row).
-- Failure drill: with infra up, upload a video, `kill -9` the worker mid-FFmpeg,
-  and confirm the lease expires, the reaper requeues the job, and a freshly
-  started worker drives the video to `ready`.
+- Failure drill (executed 2026-06-13): two workers running with a 15s lease /
+  5s heartbeat / 5s reaper interval. Uploaded a video, `kill -9`'d the worker
+  that claimed it while it was still downloading the raw file (lease held, no
+  cleanup). ~16s later — one lease span — the surviving worker's reaper logged
+  `reaper recovered jobs requeued=1 failed=0`, the requeue went out through the
+  outbox/relay, the survivor reclaimed the job as attempt 2, and the video
+  reached `ready`. A `video.job.requeued` event was recorded. No stuck video, no
+  manual intervention.

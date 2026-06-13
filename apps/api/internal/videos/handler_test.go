@@ -3,6 +3,7 @@ package videos
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -20,8 +21,7 @@ func TestUploadCreatesQueuedVideo(t *testing.T) {
 
 	repo := &fakeRepository{}
 	storage := &fakeStorage{}
-	publisher := &fakePublisher{}
-	service := NewService(repo, storage, publisher, "mediaflow-raw", 1024)
+	service := NewService(repo, storage, "mediaflow-raw", 1024)
 
 	router := gin.New()
 	NewHandler(service).RegisterRoutes(router)
@@ -49,15 +49,26 @@ func TestUploadCreatesQueuedVideo(t *testing.T) {
 		t.Fatal("expected video row creation")
 	}
 
-	if publisher.job.VideoID != repo.created.VideoID {
-		t.Fatalf("expected published job for video %q, got %q", repo.created.VideoID, publisher.job.VideoID)
+	// The upload path enqueues via the outbox, not a direct publish: the created
+	// params must carry a transcode message for this video.
+	if repo.created.OutboxRoutingKey != TranscodeRoutingKey || repo.created.OutboxExchange != VideoExchange {
+		t.Fatalf("expected outbox routed to %s/%s, got %s/%s",
+			VideoExchange, TranscodeRoutingKey, repo.created.OutboxExchange, repo.created.OutboxRoutingKey)
+	}
+
+	var job TranscodeJob
+	if err := json.Unmarshal(repo.created.OutboxPayloadJSON, &job); err != nil {
+		t.Fatalf("decode outbox payload: %v", err)
+	}
+	if job.VideoID != repo.created.VideoID {
+		t.Fatalf("expected outbox job for video %q, got %q", repo.created.VideoID, job.VideoID)
 	}
 }
 
 func TestUploadRejectsMissingTitle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	service := NewService(&fakeRepository{}, &fakeStorage{}, &fakePublisher{}, "mediaflow-raw", 1024)
+	service := NewService(&fakeRepository{}, &fakeStorage{}, "mediaflow-raw", 1024)
 	router := gin.New()
 	NewHandler(service).RegisterRoutes(router)
 
@@ -76,7 +87,7 @@ func TestUploadRejectsMissingTitle(t *testing.T) {
 func TestUploadRejectsUnsupportedFileType(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	service := NewService(&fakeRepository{}, &fakeStorage{}, &fakePublisher{}, "mediaflow-raw", 1024)
+	service := NewService(&fakeRepository{}, &fakeStorage{}, "mediaflow-raw", 1024)
 	router := gin.New()
 	NewHandler(service).RegisterRoutes(router)
 
@@ -175,13 +186,4 @@ func (s *fakeStorage) PresignedProcessedURL(context.Context, string, time.Durati
 
 func (s *fakeStorage) PresignedThumbnailURL(context.Context, string, time.Duration) (string, error) {
 	return "http://example.test/thumbnail.jpg", nil
-}
-
-type fakePublisher struct {
-	job TranscodeJob
-}
-
-func (p *fakePublisher) PublishTranscode(_ context.Context, job TranscodeJob) error {
-	p.job = job
-	return nil
 }

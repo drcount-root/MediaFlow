@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -19,6 +20,8 @@ type Config struct {
 	MinIOProcessedBucket string
 	MinIOThumbnailBucket string
 	MaxUploadBytes       int64
+	OutboxPollInterval   time.Duration
+	OutboxBatchSize      int
 }
 
 func Load() Config {
@@ -36,6 +39,8 @@ func Load() Config {
 		MinIOProcessedBucket: getEnv("MINIO_PROCESSED_BUCKET", "mediaflow-processed"),
 		MinIOThumbnailBucket: getEnv("MINIO_THUMBNAIL_BUCKET", "mediaflow-thumbnails"),
 		MaxUploadBytes:       getInt64Env("MAX_UPLOAD_BYTES", 524288000),
+		OutboxPollInterval:   getDurationEnv("OUTBOX_POLL_INTERVAL", time.Second),
+		OutboxBatchSize:      int(getInt64Env("OUTBOX_BATCH_SIZE", 100)),
 	}
 }
 
@@ -68,6 +73,20 @@ func getInt64Env(key string, fallback int64) int64 {
 	}
 
 	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+
+	return parsed
+}
+
+func getDurationEnv(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return fallback
 	}

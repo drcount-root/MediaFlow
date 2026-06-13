@@ -13,6 +13,7 @@ import (
 	"mediaflow/apps/api/internal/config"
 	"mediaflow/apps/api/internal/database"
 	httpapi "mediaflow/apps/api/internal/http"
+	"mediaflow/apps/api/internal/outbox"
 	"mediaflow/apps/api/internal/queue"
 	"mediaflow/apps/api/internal/storage"
 	"mediaflow/apps/api/internal/videos"
@@ -54,7 +55,17 @@ func main() {
 	defer publisher.Close()
 
 	repo := database.NewPostgresRepository(db)
-	videoService := videos.NewService(repo, objectStorage, publisher, cfg.MinIORawBucket, cfg.MaxUploadBytes)
+	videoService := videos.NewService(repo, objectStorage, cfg.MinIORawBucket, cfg.MaxUploadBytes)
+
+	// The outbox relay is what actually publishes transcode jobs; the request
+	// path only writes the outbox row. Run it for the lifetime of the process.
+	relay := outbox.NewRelay(db, publisher, logger, cfg.OutboxPollInterval, cfg.OutboxBatchSize)
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	go func() {
+		relay.Run(relayCtx)
+		close(relayDone)
+	}()
 
 	router := httpapi.NewRouterWithVideos(cfg, videoService)
 	server := &http.Server{
@@ -82,6 +93,9 @@ func main() {
 		logger.Error("api server shutdown failed", "error", err)
 		os.Exit(1)
 	}
+
+	relayCancel()
+	<-relayDone
 
 	logger.Info("api server stopped")
 }

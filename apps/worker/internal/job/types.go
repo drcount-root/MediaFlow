@@ -6,6 +6,12 @@ const (
 	StatusProcessing = "processing"
 	StatusReady      = "ready"
 	StatusFailed     = "failed"
+
+	// Queue contract for the transcode job, mirrored from apps/api
+	// (videos.VideoExchange / videos.TranscodeRoutingKey). Kept in sync by hand —
+	// the reaper re-enqueues via the outbox using these.
+	VideoExchange       = "mediaflow.video"
+	TranscodeRoutingKey = "video.transcode"
 )
 
 type TranscodeJob struct {

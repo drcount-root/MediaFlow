@@ -11,6 +11,7 @@ import (
 
 	"mediaflow/apps/worker/internal/config"
 	"mediaflow/apps/worker/internal/database"
+	"mediaflow/apps/worker/internal/reaper"
 	"mediaflow/apps/worker/internal/storage"
 	"mediaflow/apps/worker/internal/worker"
 )
@@ -53,10 +54,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("worker starting", "env", cfg.AppEnv, "concurrency", cfg.WorkerConcurrency)
+	// Reaper runs alongside consumption, recovering jobs whose worker died with
+	// the lease still held. Concurrent reapers across workers are safe (the scan
+	// uses FOR UPDATE SKIP LOCKED).
+	reaperDone := make(chan struct{})
+	rp := reaper.New(db, logger, cfg.MinIORawBucket, cfg.JobMaxAttempts, cfg.ReaperInterval)
+	go func() {
+		rp.Run(ctx)
+		close(reaperDone)
+	}()
+
+	logger.Info("worker starting", "env", cfg.AppEnv, "concurrency", cfg.WorkerConcurrency, "workerId", cfg.WorkerID)
 	if err := w.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("worker stopped with error", "error", err)
 		os.Exit(1)
 	}
+
+	<-reaperDone
 	logger.Info("worker stopped")
 }

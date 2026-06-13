@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -20,6 +22,13 @@ type Config struct {
 	WorkDir              string
 	FFmpegPath           string
 	FFprobePath          string
+
+	// Job leases (M5.2).
+	WorkerID          string        // identifies this worker on the lease it holds
+	JobLeaseDuration  time.Duration // how long a claim is valid before the reaper may take it
+	JobMaxAttempts    int           // attempts before a job is failed permanently
+	HeartbeatInterval time.Duration // how often a busy worker extends its lease
+	ReaperInterval    time.Duration // how often the reaper scans for expired leases
 }
 
 func Load() Config {
@@ -38,7 +47,22 @@ func Load() Config {
 		WorkDir:              getEnv("WORK_DIR", "/tmp/mediaflow-worker"),
 		FFmpegPath:           getEnv("FFMPEG_PATH", "ffmpeg"),
 		FFprobePath:          getEnv("FFPROBE_PATH", "ffprobe"),
+		WorkerID:             getEnv("WORKER_ID", defaultWorkerID()),
+		JobLeaseDuration:     time.Duration(getIntEnv("JOB_LEASE_SECONDS", 120)) * time.Second,
+		JobMaxAttempts:       getIntEnv("JOB_MAX_ATTEMPTS", 3),
+		HeartbeatInterval:    getDurationEnv("JOB_HEARTBEAT_INTERVAL", 30*time.Second),
+		ReaperInterval:       getDurationEnv("REAPER_INTERVAL", 30*time.Second),
 	}
+}
+
+// defaultWorkerID identifies this process when it claims a job, so the reaper
+// and logs can tell workers apart. Overridable via WORKER_ID.
+func defaultWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "worker"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
 func getEnv(key, fallback string) string {
@@ -67,6 +91,18 @@ func getIntEnv(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getDurationEnv(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return fallback
 	}

@@ -33,7 +33,7 @@ func NewRepository(db *sql.DB) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) ClaimJob(ctx context.Context, jobID, videoID string) (bool, error) {
+func (r *Repository) ClaimJob(ctx context.Context, jobID, videoID, workerID string, lease time.Duration) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -54,11 +54,19 @@ func (r *Repository) ClaimJob(ctx context.Context, jobID, videoID string) (bool,
 		return false, tx.Commit()
 	}
 
+	// Claiming stamps this worker's id and a fresh lease, and counts the attempt.
+	// Only queued/failed jobs are claimable; a job another worker is processing
+	// (with a live lease) is not — the reaper resets it to queued if its lease
+	// expires.
 	result, err := tx.ExecContext(ctx, `
 		UPDATE video_jobs
-		SET status = 'processing', attempts = attempts + 1, updated_at = now()
+		SET status = 'processing',
+			attempts = attempts + 1,
+			claimed_by = $3,
+			lease_expires_at = now() + make_interval(secs => $4),
+			updated_at = now()
 		WHERE id = $1 AND video_id = $2 AND status IN ('queued', 'failed')
-	`, jobID, videoID)
+	`, jobID, videoID, workerID, int(lease.Seconds()))
 	if err != nil {
 		return false, err
 	}
@@ -88,6 +96,18 @@ func (r *Repository) ClaimJob(ctx context.Context, jobID, videoID string) (bool,
 	}
 
 	return true, tx.Commit()
+}
+
+// Heartbeat extends the lease on a job this worker still holds. The guard on
+// claimed_by + status means a worker that lost its claim (e.g. the reaper
+// already requeued it) silently stops extending — it affects zero rows.
+func (r *Repository) Heartbeat(ctx context.Context, jobID, workerID string, lease time.Duration) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE video_jobs
+		SET lease_expires_at = now() + make_interval(secs => $3), updated_at = now()
+		WHERE id = $1 AND claimed_by = $2 AND status = 'processing'
+	`, jobID, workerID, int(lease.Seconds()))
+	return err
 }
 
 func (r *Repository) SaveProbe(ctx context.Context, videoID string, probe job.ProbeResult) error {

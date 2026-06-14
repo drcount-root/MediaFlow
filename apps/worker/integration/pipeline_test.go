@@ -65,6 +65,11 @@ func TestPipelineProcessesUploadToReady(t *testing.T) {
 		WorkDir:              t.TempDir(),
 		FFmpegPath:           "ffmpeg",
 		FFprobePath:          "ffprobe",
+		WorkerID:             "test-worker",
+		JobLeaseDuration:     2 * time.Minute,
+		JobMaxAttempts:       3,
+		HeartbeatInterval:    30 * time.Second,
+		ReaperInterval:       30 * time.Second,
 	}
 
 	objStore, err := storage.NewMinIOStorage(

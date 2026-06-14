@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"mediaflow/apps/worker/internal/config"
@@ -126,7 +127,7 @@ func (w *Worker) handleDelivery(ctx context.Context, delivery amqp.Delivery) {
 }
 
 func (w *Worker) Process(ctx context.Context, payload job.TranscodeJob) error {
-	claimed, err := w.repo.ClaimJob(ctx, payload.JobID, payload.VideoID)
+	claimed, err := w.repo.ClaimJob(ctx, payload.JobID, payload.VideoID, w.cfg.WorkerID, w.cfg.JobLeaseDuration)
 	if err != nil {
 		return err
 	}
@@ -134,6 +135,12 @@ func (w *Worker) Process(ctx context.Context, payload job.TranscodeJob) error {
 		w.logger.Info("job skipped", "jobId", payload.JobID, "videoId", payload.VideoID)
 		return nil
 	}
+
+	// Keep the lease alive while FFmpeg runs so the reaper does not reclaim a job
+	// that is making progress. The heartbeat stops when processing returns.
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go w.heartbeat(hbCtx, payload.JobID)
 
 	workDir := filepath.Join(w.cfg.WorkDir, payload.JobID)
 	inputPath := filepath.Join(workDir, "input.mp4")
@@ -182,6 +189,22 @@ func (w *Worker) Process(ctx context.Context, payload job.TranscodeJob) error {
 	}
 
 	return w.repo.CompleteJob(ctx, payload.JobID, payload.VideoID, baseKey+"/master.m3u8", thumbnailKey, variants)
+}
+
+func (w *Worker) heartbeat(ctx context.Context, jobID string) {
+	ticker := time.NewTicker(w.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.repo.Heartbeat(ctx, jobID, w.cfg.WorkerID, w.cfg.JobLeaseDuration); err != nil && ctx.Err() == nil {
+				w.logger.Warn("lease heartbeat failed", "jobId", jobID, "error", err)
+			}
+		}
+	}
 }
 
 func (w *Worker) uploadHLS(ctx context.Context, baseKey, hlsDir string, variants []job.Variant) error {

@@ -32,6 +32,9 @@ type Config struct {
 
 	// Retries/DLQ (M5.3).
 	RetryBaseDelay time.Duration // backoff base; per-message TTL is RetryBaseDelay * 2^attempts
+
+	// Graceful shutdown (M5.4).
+	ShutdownGrace time.Duration // how long to let an in-flight job finish on SIGTERM before aborting it
 }
 
 func Load() Config {
@@ -56,6 +59,7 @@ func Load() Config {
 		HeartbeatInterval:    getDurationEnv("JOB_HEARTBEAT_INTERVAL", 30*time.Second),
 		ReaperInterval:       getDurationEnv("REAPER_INTERVAL", 30*time.Second),
 		RetryBaseDelay:       getDurationEnv("JOB_RETRY_BASE_DELAY", 30*time.Second),
+		ShutdownGrace:        getDurationEnv("WORKER_SHUTDOWN_GRACE", 30*time.Second),
 	}
 }
 

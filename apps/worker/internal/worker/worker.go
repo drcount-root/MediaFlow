@@ -129,23 +129,61 @@ func declareRetryAndDLQ(channel *amqp.Channel) error {
 	return channel.QueueBind(dlqQueue, job.DLQRoutingKey, "mediaflow.video", false, nil)
 }
 
+const consumerTag = "mediaflow-worker"
+
 func (w *Worker) Run(ctx context.Context) error {
-	deliveries, err := w.channel.Consume(transcodeQueue, "", false, false, false, false, nil)
+	deliveries, err := w.channel.Consume(transcodeQueue, consumerTag, false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
 
+	// jobCtx governs in-flight processing and is independent of ctx: a shutdown
+	// signal lets the current job finish. The watcher below cancels jobCtx only if
+	// the grace period elapses (a hung/long job) — then the reaper recovers it.
+	jobCtx, cancelJobs := context.WithCancel(context.Background())
+	defer cancelJobs()
+
+	stopped := make(chan struct{})
+	go w.watchShutdown(ctx, cancelJobs, stopped)
+
 	w.logger.Info("worker consuming", "queue", transcodeQueue)
+	shutdownCh := ctx.Done()
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-shutdownCh:
+			// Observe the shutdown signal once. The watcher cancels the AMQP
+			// consumer, which closes `deliveries` after any prefetched message is
+			// handled; stop selecting on this channel so we don't busy-loop.
+			shutdownCh = nil
 		case delivery, ok := <-deliveries:
 			if !ok {
+				close(stopped)
 				return nil
 			}
-			w.handleDelivery(ctx, delivery)
+			w.handleDelivery(jobCtx, delivery)
 		}
+	}
+}
+
+// watchShutdown waits for a shutdown signal, stops the worker pulling new work,
+// and gives the in-flight job a grace period before aborting it.
+func (w *Worker) watchShutdown(ctx context.Context, abortJob context.CancelFunc, stopped <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+	case <-stopped:
+		return
+	}
+
+	w.logger.Info("shutdown signalled; draining in-flight job", "grace", w.cfg.ShutdownGrace.String())
+	if err := w.channel.Cancel(consumerTag, false); err != nil {
+		w.logger.Warn("consumer cancel failed", "error", err)
+	}
+
+	select {
+	case <-time.After(w.cfg.ShutdownGrace):
+		w.logger.Warn("shutdown grace exceeded; aborting in-flight job (reaper will recover it)")
+		abortJob()
+	case <-stopped:
 	}
 }
 

@@ -190,6 +190,57 @@ func TestMarkQueuedForRetryReleasesClaim(t *testing.T) {
 	}
 }
 
+// TestRedeliveryOfReadyVideoIsSkipped proves idempotent reprocessing: a duplicate
+// delivery for a video that is already `ready` is a no-op — the claim is refused,
+// so no work runs and existing variants are untouched.
+func TestRedeliveryOfReadyVideoIsSkipped(t *testing.T) {
+	db := openDB(t)
+	truncateAll(t, db)
+	ctx := context.Background()
+
+	videoID := uuid.NewString()
+	jobID := uuid.NewString()
+	rawKey := "raw-videos/" + videoID + "/original.mp4"
+
+	// Seed an already-completed video with one variant, as a finished run leaves it.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO videos (id, title, status, raw_object_key, hls_master_key, original_filename, content_type, size_bytes)
+		VALUES ($1, 'Done', 'ready', $2, $3, 'f.mp4', 'video/mp4', 0)
+	`, videoID, rawKey, "processed-videos/"+videoID+"/master.m3u8"); err != nil {
+		t.Fatalf("seed ready video: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO video_jobs (id, video_id, job_type, status) VALUES ($1, $2, 'transcode', 'completed')
+	`, jobID, videoID); err != nil {
+		t.Fatalf("seed completed job: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO video_variants (video_id, quality, width, height, bitrate, codec, playlist_key)
+		VALUES ($1, '360p', 640, 360, 800000, 'h264', $2)
+	`, videoID, "processed-videos/"+videoID+"/360p/index.m3u8"); err != nil {
+		t.Fatalf("seed variant: %v", err)
+	}
+
+	w := newTestWorker(t, db)
+	if err := w.Process(ctx, job.TranscodeJob{JobID: jobID, VideoID: videoID, RawBucket: rawBucket, RawObjectKey: rawKey, RequestedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("Process on a ready video should be a no-op, got: %v", err)
+	}
+
+	var (
+		status   string
+		variants int
+	)
+	if err := db.QueryRowContext(ctx, `SELECT status FROM videos WHERE id = $1`, videoID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM video_variants WHERE video_id = $1`, videoID).Scan(&variants); err != nil {
+		t.Fatalf("count variants: %v", err)
+	}
+	if status != "ready" || variants != 1 {
+		t.Fatalf("redelivery must not reprocess: status=%q variants=%d", status, variants)
+	}
+}
+
 // --- helpers ---
 
 func newTestWorker(t *testing.T, db *sql.DB) *worker.Worker {
@@ -213,6 +264,7 @@ func newTestWorker(t *testing.T, db *sql.DB) *worker.Worker {
 		HeartbeatInterval:    30 * time.Second,
 		ReaperInterval:       30 * time.Second,
 		RetryBaseDelay:       30 * time.Second,
+		ShutdownGrace:        60 * time.Second,
 	}
 	objStore, err := storage.NewMinIOStorage(
 		cfg.MinIOEndpoint, cfg.MinIOAccessKey, cfg.MinIOSecretKey, cfg.MinIOUseSSL,

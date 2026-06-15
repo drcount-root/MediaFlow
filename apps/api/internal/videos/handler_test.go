@@ -65,6 +65,52 @@ func TestUploadCreatesQueuedVideo(t *testing.T) {
 	}
 }
 
+func TestUploadReplaysIdempotencyKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	repo := &fakeRepository{}
+	storage := &fakeStorage{}
+	service := NewService(repo, storage, "mediaflow-raw", 1<<20)
+
+	router := gin.New()
+	NewHandler(service).RegisterRoutes(router)
+
+	doUpload := func() *httptest.ResponseRecorder {
+		body, contentType := multipartBody(t, map[string]string{"title": "Demo"}, "file", "demo.mp4", "video/mp4", "video bytes")
+		request := httptest.NewRequest(http.MethodPost, "/videos/upload", body)
+		request.Header.Set("Content-Type", contentType)
+		request.Header.Set("Idempotency-Key", "abc-123")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	first := doUpload()
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first upload: expected 201, got %d: %s", first.Code, first.Body.String())
+	}
+
+	second := doUpload()
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay: expected 200, got %d: %s", second.Code, second.Body.String())
+	}
+
+	if repo.createCalls != 1 {
+		t.Fatalf("expected exactly one video created across two requests, got %d", repo.createCalls)
+	}
+
+	var v1, v2 Video
+	if err := json.Unmarshal(first.Body.Bytes(), &v1); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &v2); err != nil {
+		t.Fatalf("decode second: %v", err)
+	}
+	if v1.ID != v2.ID {
+		t.Fatalf("replay returned a different video: %q vs %q", v1.ID, v2.ID)
+	}
+}
+
 func TestUploadRejectsMissingTitle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -136,13 +182,16 @@ func multipartBody(t *testing.T, fields map[string]string, fileField, filename, 
 }
 
 type fakeRepository struct {
-	created CreateQueuedVideoParams
-	video   Video
+	created     CreateQueuedVideoParams
+	video       Video
+	byKey       map[string]Video
+	createCalls int
 }
 
 func (r *fakeRepository) CreateQueuedVideo(_ context.Context, params CreateQueuedVideoParams) (Video, error) {
+	r.createCalls++
 	r.created = params
-	return Video{
+	video := Video{
 		ID:               params.VideoID,
 		Title:            params.Title,
 		Description:      params.Description,
@@ -153,7 +202,21 @@ func (r *fakeRepository) CreateQueuedVideo(_ context.Context, params CreateQueue
 		SizeBytes:        &params.SizeBytes,
 		CreatedAt:        time.Now().UTC(),
 		UpdatedAt:        time.Now().UTC(),
-	}, nil
+	}
+	if params.IdempotencyKey != nil {
+		if r.byKey == nil {
+			r.byKey = map[string]Video{}
+		}
+		r.byKey[*params.IdempotencyKey] = video
+	}
+	return video, nil
+}
+
+func (r *fakeRepository) GetVideoByIdempotencyKey(_ context.Context, key string) (Video, error) {
+	if stored, ok := r.byKey[key]; ok {
+		return stored, nil
+	}
+	return Video{}, ErrNotFound
 }
 
 func (r *fakeRepository) ListVideos(context.Context) ([]Video, error) {

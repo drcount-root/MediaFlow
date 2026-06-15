@@ -3,6 +3,7 @@ package videos
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,18 +27,35 @@ func NewService(repo Repository, storage ObjectStorage, rawBucket string, maxUpl
 	}
 }
 
-func (s *Service) Upload(ctx context.Context, params UploadParams) (Video, error) {
+// Upload stores the raw video and enqueues a transcode job. The returned bool is
+// true when a new video was created and false when an Idempotency-Key replay
+// returned an existing one.
+func (s *Service) Upload(ctx context.Context, params UploadParams) (Video, bool, error) {
 	title := strings.TrimSpace(params.Title)
 	if title == "" || params.Body == nil {
-		return Video{}, ErrInvalidInput
+		return Video{}, false, ErrInvalidInput
 	}
 
 	if s.maxUploadBytes > 0 && params.SizeBytes > s.maxUploadBytes {
-		return Video{}, ErrFileTooLarge
+		return Video{}, false, ErrFileTooLarge
 	}
 
 	if !isSupportedMP4(params.ContentType, params.OriginalFilename) {
-		return Video{}, ErrUnsupportedMedia
+		return Video{}, false, ErrUnsupportedMedia
+	}
+
+	key := strings.TrimSpace(params.IdempotencyKey)
+
+	// Fast path: a prior request with this key already created the video. Return
+	// it without re-uploading the bytes or creating a duplicate.
+	if key != "" {
+		existing, err := s.repo.GetVideoByIdempotencyKey(ctx, key)
+		if err == nil {
+			return existing, false, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Video{}, false, err
+		}
 	}
 
 	videoID := uuid.NewString()
@@ -46,7 +64,7 @@ func (s *Service) Upload(ctx context.Context, params UploadParams) (Video, error
 	rawKey := "raw-videos/" + videoID + "/original" + normalizedExt(params.OriginalFilename)
 
 	if err := s.storage.UploadRaw(ctx, rawKey, params.Body, params.SizeBytes, params.ContentType); err != nil {
-		return Video{}, err
+		return Video{}, false, err
 	}
 
 	// Build the transcode job and hand it to the repository as an outbox row.
@@ -61,7 +79,7 @@ func (s *Service) Upload(ctx context.Context, params UploadParams) (Video, error
 		RequestedAt:  time.Now().UTC(),
 	})
 	if err != nil {
-		return Video{}, err
+		return Video{}, false, err
 	}
 
 	video, err := s.repo.CreateQueuedVideo(ctx, CreateQueuedVideoParams{
@@ -73,15 +91,25 @@ func (s *Service) Upload(ctx context.Context, params UploadParams) (Video, error
 		OriginalFilename:  params.OriginalFilename,
 		ContentType:       params.ContentType,
 		SizeBytes:         params.SizeBytes,
+		IdempotencyKey:    optionalString(key),
 		OutboxExchange:    VideoExchange,
 		OutboxRoutingKey:  TranscodeRoutingKey,
 		OutboxPayloadJSON: payload,
 	})
+	// Lost the race: a concurrent request with the same key committed first.
+	// Return its row — the duplicate raw object we just wrote is harmless.
+	if errors.Is(err, ErrDuplicateKey) && key != "" {
+		existing, getErr := s.repo.GetVideoByIdempotencyKey(ctx, key)
+		if getErr != nil {
+			return Video{}, false, getErr
+		}
+		return existing, false, nil
+	}
 	if err != nil {
-		return Video{}, err
+		return Video{}, false, err
 	}
 
-	return video, nil
+	return video, true, nil
 }
 
 func (s *Service) List(ctx context.Context) ([]Video, error) {

@@ -36,20 +36,27 @@ func (h *Handler) upload(ctx *gin.Context) {
 	}
 	defer body.Close()
 
-	video, err := h.service.Upload(ctx.Request.Context(), UploadParams{
+	video, created, err := h.service.Upload(ctx.Request.Context(), UploadParams{
 		Title:            ctx.PostForm("title"),
 		Description:      ctx.PostForm("description"),
 		OriginalFilename: file.Filename,
 		ContentType:      file.Header.Get("Content-Type"),
 		SizeBytes:        file.Size,
 		Body:             body,
+		IdempotencyKey:   ctx.GetHeader("Idempotency-Key"),
 	})
 	if err != nil {
 		writeServiceError(ctx, err)
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, video)
+	// A replayed Idempotency-Key returns the original resource with 200; a fresh
+	// upload returns 201.
+	if created {
+		ctx.JSON(http.StatusCreated, video)
+		return
+	}
+	ctx.JSON(http.StatusOK, video)
 }
 
 func (h *Handler) list(ctx *gin.Context) {

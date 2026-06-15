@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"mediaflow/apps/api/internal/videos"
 )
@@ -47,15 +48,18 @@ func (r *PostgresRepository) CreateQueuedVideo(ctx context.Context, params video
 	row := tx.QueryRowContext(ctx, `
 		INSERT INTO videos (
 			id, title, description, status, raw_object_key,
-			original_filename, content_type, size_bytes
+			original_filename, content_type, size_bytes, idempotency_key
 		)
-		VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
+		VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8)
 		RETURNING id, title, description, status, raw_object_key, hls_master_key,
 			thumbnail_key, duration_seconds, original_filename, content_type, size_bytes,
 			error_message, created_at, updated_at
-	`, params.VideoID, params.Title, params.Description, params.RawObjectKey, params.OriginalFilename, params.ContentType, params.SizeBytes)
+	`, params.VideoID, params.Title, params.Description, params.RawObjectKey, params.OriginalFilename, params.ContentType, params.SizeBytes, params.IdempotencyKey)
 
 	video, err := scanVideo(row)
+	if isUniqueViolation(err) {
+		return videos.Video{}, videos.ErrDuplicateKey
+	}
 	if err != nil {
 		return videos.Video{}, err
 	}
@@ -90,6 +94,26 @@ func (r *PostgresRepository) CreateQueuedVideo(ctx context.Context, params video
 	}
 
 	if err := tx.Commit(); err != nil {
+		return videos.Video{}, err
+	}
+
+	return video, nil
+}
+
+func (r *PostgresRepository) GetVideoByIdempotencyKey(ctx context.Context, key string) (videos.Video, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, title, description, status, raw_object_key, hls_master_key,
+			thumbnail_key, duration_seconds, original_filename, content_type, size_bytes,
+			error_message, created_at, updated_at
+		FROM videos
+		WHERE idempotency_key = $1
+	`, key)
+
+	video, err := scanVideo(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return videos.Video{}, videos.ErrNotFound
+	}
+	if err != nil {
 		return videos.Video{}, err
 	}
 
@@ -220,6 +244,13 @@ func scanVideo(scanner videoScanner) (videos.Video, error) {
 	video.ErrorMessage = nullableString(errorMessage)
 
 	return video, nil
+}
+
+// isUniqueViolation reports whether err is a Postgres unique-constraint error
+// (SQLSTATE 23505), e.g. a concurrent upload racing on the same idempotency key.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func nullableString(value sql.NullString) *string {

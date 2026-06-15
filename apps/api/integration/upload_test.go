@@ -35,7 +35,7 @@ func TestUploadStoresAndWritesOutbox(t *testing.T) {
 	service := videos.NewService(repo, objStore, rawBucket, 0)
 
 	contents := "fake mp4 bytes for integration"
-	created, err := service.Upload(ctx, videos.UploadParams{
+	created, isNew, err := service.Upload(ctx, videos.UploadParams{
 		Title:            "Pipeline Upload",
 		OriginalFilename: "pipeline.mp4",
 		ContentType:      "video/mp4",
@@ -44,6 +44,9 @@ func TestUploadStoresAndWritesOutbox(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Upload: %v", err)
+	}
+	if !isNew {
+		t.Fatal("expected a freshly created video")
 	}
 	if created.Status != videos.StatusQueued {
 		t.Fatalf("expected queued status, got %s", created.Status)
@@ -96,5 +99,62 @@ func TestUploadStoresAndWritesOutbox(t *testing.T) {
 	}
 	if job.VideoID != created.ID || job.RawObjectKey != *stored.RawObjectKey {
 		t.Fatalf("outbox job does not match video: %#v", job)
+	}
+}
+
+// TestUploadIdempotencyKeyReplays proves that replaying an upload with the same
+// Idempotency-Key returns the original video and creates no duplicate, against a
+// real Postgres unique index.
+func TestUploadIdempotencyKeyReplays(t *testing.T) {
+	db := openDB(t)
+	truncateAll(t, db)
+	ctx := context.Background()
+
+	repo := database.NewPostgresRepository(db)
+	objStore, err := storage.NewMinIOStorage(
+		infra.minioEndpoint, infra.minioAccessKey, infra.minioSecretKey, false,
+		rawBucket, processedBucket, thumbnailBucket,
+	)
+	if err != nil {
+		t.Fatalf("new minio storage: %v", err)
+	}
+	service := videos.NewService(repo, objStore, rawBucket, 0)
+
+	params := func() videos.UploadParams {
+		return videos.UploadParams{
+			Title:            "Replay",
+			OriginalFilename: "replay.mp4",
+			ContentType:      "video/mp4",
+			SizeBytes:        4,
+			Body:             strings.NewReader("data"),
+			IdempotencyKey:   "key-xyz",
+		}
+	}
+
+	first, isNew, err := service.Upload(ctx, params())
+	if err != nil {
+		t.Fatalf("first upload: %v", err)
+	}
+	if !isNew {
+		t.Fatal("first upload should be new")
+	}
+
+	second, isNew, err := service.Upload(ctx, params())
+	if err != nil {
+		t.Fatalf("replay upload: %v", err)
+	}
+	if isNew {
+		t.Fatal("replay should not create a new video")
+	}
+	if second.ID != first.ID {
+		t.Fatalf("replay returned a different video: %q vs %q", second.ID, first.ID)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM videos`).Scan(&count); err != nil {
+		t.Fatalf("count videos: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one video after replay, got %d", count)
 	}
 }

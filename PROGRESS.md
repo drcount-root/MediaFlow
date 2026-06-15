@@ -10,8 +10,8 @@ Current focus:
 
 ```txt
 Milestone 5: Correctness Under Failure
-slices A (transactional outbox) + B (leases+reaper) + C (retries/DLQ) — done
-next slice: D idempotency+shutdown
+slices A (outbox) + B (leases+reaper) + C (retries/DLQ) + D (idempotency+shutdown) — done
+remaining: RabbitMQ-down-during-upload failure drill, then M5 complete
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -25,7 +25,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
 | 4. CI and Integration Test Harness | Done | GitHub Actions + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow). CI green on PR #1 and required via a ruleset on a public, protected `main`. ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
-| 5. Correctness Under Failure | In progress | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `docs/adr/0004-retries-backoff-dlq.md`). Remaining: idempotency, graceful shutdown. |
+| 5. Correctness Under Failure | In progress | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `0004`). Slice D (idempotency+shutdown) done: `Idempotency-Key` on upload (partial unique index, replay returns original with 200, race recovers via 23505), graceful SIGTERM (drain in-flight job within `WORKER_SHUTDOWN_GRACE`, reaper covers overruns), retry hygiene verified (skip-if-ready, variant clear, deterministic keys) (ADR `docs/adr/0005-idempotency-and-graceful-shutdown.md`). Remaining: RabbitMQ-down-during-upload drill. |
 | 6. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
 | 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
 | 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
@@ -144,11 +144,11 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 - [x] Declare `video.transcode.retry` queue with per-message TTL and DLX back to `video.transcode`
 - [x] Declare `video.transcode.dlq` and route exhausted/poison messages there
 - [x] Classify permanent vs transient failures (no retry for corrupt input)
-- [ ] Add `Idempotency-Key` support on upload
-- [ ] Make worker retries overwrite-safe (clear stale variants, deterministic keys)
-- [ ] Add graceful worker shutdown (finish in-flight job on SIGTERM)
-- [ ] Write `video_events` row on every status transition
-- [ ] Tests (incl. integration): outbox relay, claim/lease, retry routing, reaper, idempotency key
+- [x] Add `Idempotency-Key` support on upload
+- [x] Make worker retries overwrite-safe (clear stale variants, deterministic keys)
+- [x] Add graceful worker shutdown (finish in-flight job on SIGTERM)
+- [x] Write `video_events` row on every status transition
+- [x] Tests (incl. integration): outbox relay, claim/lease, retry routing, reaper, idempotency key
 - [x] Failure drill: `kill -9` worker mid-job → reaper recovers → video `ready` (2026-06-13: two-worker run, killed the claimer mid-download with the lease held; the survivor's reaper logged `requeued=1` ~16s later, reclaimed as attempt 2, drove the video to `ready`; `video.job.requeued` event recorded and the requeue flowed through the outbox)
 - [ ] Failure drill: RabbitMQ down during upload → outbox drains after restart
 - [x] Failure drill: poison message lands in DLQ without wedging the consumer (integration `TestPoisonMessageDeadLettered`: unparseable body → DLQ with `x-failure-reason`, then a valid job still reaches `ready` — real RabbitMQ via testcontainers)

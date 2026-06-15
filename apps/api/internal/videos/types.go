@@ -30,6 +30,10 @@ var (
 	ErrVideoNotReady    = errors.New("video not ready")
 	ErrUnsupportedMedia = errors.New("unsupported media type")
 	ErrFileTooLarge     = errors.New("file too large")
+	// ErrDuplicateKey signals that a video with the same idempotency key already
+	// exists — the repository lost the race to insert it. The service recovers by
+	// returning the existing row.
+	ErrDuplicateKey = errors.New("duplicate idempotency key")
 )
 
 type Video struct {
@@ -69,6 +73,7 @@ type CreateQueuedVideoParams struct {
 	OriginalFilename string
 	ContentType      string
 	SizeBytes        int64
+	IdempotencyKey   *string
 
 	// Outbox message published once the row is committed. Written in the same
 	// transaction as the video and job so the enqueue can never be lost or
@@ -85,6 +90,7 @@ type UploadParams struct {
 	ContentType      string
 	SizeBytes        int64
 	Body             io.Reader
+	IdempotencyKey   string
 }
 
 type TranscodeJob struct {
@@ -97,6 +103,7 @@ type TranscodeJob struct {
 
 type Repository interface {
 	CreateQueuedVideo(ctx context.Context, params CreateQueuedVideoParams) (Video, error)
+	GetVideoByIdempotencyKey(ctx context.Context, key string) (Video, error)
 	ListVideos(ctx context.Context) ([]Video, error)
 	GetVideo(ctx context.Context, id string) (Video, error)
 	GetVariants(ctx context.Context, videoID string) ([]Variant, error)

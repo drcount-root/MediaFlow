@@ -23,7 +23,9 @@ func (p FFmpegProcessor) Probe(ctx context.Context, inputPath string) (job.Probe
 	cmd := exec.CommandContext(ctx, p.FFprobePath, "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=codec_type,width,height", "-of", "json", inputPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return job.ProbeResult{}, fmt.Errorf("ffprobe failed: %w: %s", err, string(output))
+		// ffprobe rejecting the input means it is unreadable/corrupt — retrying the
+		// same bytes will not help, so this is a permanent failure.
+		return job.ProbeResult{}, job.Permanent(fmt.Errorf("ffprobe failed: %w: %s", err, string(output)))
 	}
 
 	var parsed struct {
@@ -55,7 +57,7 @@ func (p FFmpegProcessor) Probe(ctx context.Context, inputPath string) (job.Probe
 	}
 
 	if result.Width == 0 || result.Height == 0 {
-		return job.ProbeResult{}, fmt.Errorf("no video stream found")
+		return job.ProbeResult{}, job.Permanent(fmt.Errorf("no video stream found"))
 	}
 
 	return result, nil

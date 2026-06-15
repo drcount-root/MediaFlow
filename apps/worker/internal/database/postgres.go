@@ -173,20 +173,81 @@ func (r *Repository) CompleteJob(ctx context.Context, jobID, videoID, hlsMasterK
 	return tx.Commit()
 }
 
+// JobAttempts returns the current attempt count on a job. The worker reads it
+// after a failed run to decide between scheduling a retry and giving up.
+func (r *Repository) JobAttempts(ctx context.Context, jobID string) (int, error) {
+	var attempts int
+	err := r.db.QueryRowContext(ctx, `SELECT attempts FROM video_jobs WHERE id = $1`, jobID).Scan(&attempts)
+	return attempts, err
+}
+
+// MarkQueuedForRetry returns a transiently-failed job to the claimable `queued`
+// state and clears its lease, so the redelivered retry message can re-claim it.
+// The video stays `processing` — from the user's view it is still in flight —
+// and a `video.job.retry_scheduled` event records the attempt and backoff. The
+// re-claim increments attempts, so this does not.
+func (r *Repository) MarkQueuedForRetry(ctx context.Context, jobID, videoID string, cause error, attempts int, delay time.Duration) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	message := "unknown processing error"
+	if cause != nil {
+		message = cause.Error()
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE video_jobs
+		SET status = 'queued', last_error = $2, claimed_by = NULL, lease_expires_at = NULL, updated_at = now()
+		WHERE id = $1
+	`, jobID, message); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO video_events (video_id, event_type, message, metadata_json)
+		VALUES ($1, 'video.job.retry_scheduled', $2, jsonb_build_object('attempts', $3::int, 'delayMs', $4::bigint))
+	`, videoID, message, attempts, delay.Milliseconds()); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
 func (r *Repository) FailJob(ctx context.Context, jobID, videoID string, cause error) error {
 	message := "unknown processing error"
 	if cause != nil {
 		message = cause.Error()
 	}
-	_, err := r.db.ExecContext(ctx, `
-		UPDATE videos SET status = 'failed', error_message = $3, updated_at = now()
-		WHERE id = $1;
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE videos SET status = 'failed', error_message = $2, updated_at = now()
+		WHERE id = $1
+	`, videoID, message); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE video_jobs SET status = 'failed', last_error = $3, updated_at = now()
-		WHERE id = $2 AND video_id = $1;
+		WHERE id = $1 AND video_id = $2
+	`, jobID, videoID, message); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO video_events (video_id, event_type, message)
-		VALUES ($1, 'video.processing.failed', $3);
-	`, videoID, jobID, message)
-	return err
+		VALUES ($1, 'video.processing.failed', $2)
+	`, videoID, message); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (r *Repository) addEvent(ctx context.Context, videoID, eventType, message string) error {

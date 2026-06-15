@@ -29,6 +29,9 @@ type Config struct {
 	JobMaxAttempts    int           // attempts before a job is failed permanently
 	HeartbeatInterval time.Duration // how often a busy worker extends its lease
 	ReaperInterval    time.Duration // how often the reaper scans for expired leases
+
+	// Retries/DLQ (M5.3).
+	RetryBaseDelay time.Duration // backoff base; per-message TTL is RetryBaseDelay * 2^attempts
 }
 
 func Load() Config {
@@ -52,6 +55,7 @@ func Load() Config {
 		JobMaxAttempts:       getIntEnv("JOB_MAX_ATTEMPTS", 3),
 		HeartbeatInterval:    getDurationEnv("JOB_HEARTBEAT_INTERVAL", 30*time.Second),
 		ReaperInterval:       getDurationEnv("REAPER_INTERVAL", 30*time.Second),
+		RetryBaseDelay:       getDurationEnv("JOB_RETRY_BASE_DELAY", 30*time.Second),
 	}
 }
 

@@ -25,7 +25,7 @@ func newUploadService(t *testing.T) *uploads.Service {
 		t.Fatalf("new minio storage: %v", err)
 	}
 	repo := database.NewPostgresRepository(openDB(t))
-	return uploads.NewService(repo, st, 500*1024*1024, time.Hour, time.Hour)
+	return uploads.NewService(repo, st, rawBucket, 500*1024*1024, time.Hour, time.Hour)
 }
 
 // putPart uploads bytes to a presigned part URL exactly as a browser would, and
@@ -110,6 +110,156 @@ func TestUploadSessionPresignedPartsRoundTrip(t *testing.T) {
 	if sizes[1] != int64(partSize) || sizes[2] != 1024 {
 		t.Fatalf("unexpected part sizes: %#v", sizes)
 	}
+}
+
+// TestUploadSessionCompleteEnqueuesTranscode drives a full multipart upload
+// against real MinIO and finalizes it: a video row appears (queued), an outbox
+// message is written (M5 enqueue), and the session is marked completed.
+func TestUploadSessionCompleteEnqueuesTranscode(t *testing.T) {
+	db := openDB(t)
+	truncateAll(t, db)
+	svc := newUploadService(t)
+	ctx := context.Background()
+
+	total := int64(partSize + 1024)
+	session, err := svc.Create(ctx, uploads.CreateParams{
+		Title:            "Complete Me",
+		OriginalFilename: "clip.mp4",
+		ContentType:      "video/mp4",
+		TotalSize:        total,
+		PartSize:         partSize,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	declared := uploadAllParts(t, svc, session.ID, map[int][]byte{
+		1: bytes.Repeat([]byte("a"), partSize),
+		2: bytes.Repeat([]byte("b"), 1024),
+	})
+
+	videoID, created, err := svc.Complete(ctx, session.ID, declared)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if !created || videoID == "" {
+		t.Fatalf("expected a created video, got created=%v id=%q", created, videoID)
+	}
+
+	// Video row exists, queued, pointing at the assembled object.
+	var status, rawKey string
+	var sizeBytes int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT status, raw_object_key, size_bytes FROM videos WHERE id = $1`, videoID).
+		Scan(&status, &rawKey, &sizeBytes); err != nil {
+		t.Fatalf("load video: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected video queued, got %q", status)
+	}
+	if rawKey != session.ObjectKey {
+		t.Fatalf("video raw key %q != session object key %q", rawKey, session.ObjectKey)
+	}
+	if sizeBytes != total {
+		t.Fatalf("expected assembled size %d, got %d", total, sizeBytes)
+	}
+
+	// Exactly one outbox message was written (the transcode enqueue).
+	var outbox int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM outbox_messages`).Scan(&outbox); err != nil {
+		t.Fatalf("count outbox: %v", err)
+	}
+	if outbox != 1 {
+		t.Fatalf("expected 1 outbox message, got %d", outbox)
+	}
+
+	// Session is completed and linked to the video.
+	var sessStatus string
+	var sessVideoID *string
+	if err := db.QueryRowContext(ctx,
+		`SELECT status, video_id FROM upload_sessions WHERE id = $1`, session.ID).
+		Scan(&sessStatus, &sessVideoID); err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	if sessStatus != "completed" || sessVideoID == nil || *sessVideoID != videoID {
+		t.Fatalf("session not linked: status=%q videoID=%v", sessStatus, sessVideoID)
+	}
+}
+
+// TestUploadSessionCompleteRejectsTamperedPart proves the tampered-part drill: a
+// declared ETag that doesn't match the stored part fails completion cleanly —
+// no video, no outbox row, session left resumable.
+func TestUploadSessionCompleteRejectsTamperedPart(t *testing.T) {
+	db := openDB(t)
+	truncateAll(t, db)
+	svc := newUploadService(t)
+	ctx := context.Background()
+
+	session, err := svc.Create(ctx, uploads.CreateParams{
+		Title:            "Tampered",
+		OriginalFilename: "clip.mp4",
+		ContentType:      "video/mp4",
+		TotalSize:        int64(partSize + 1024),
+		PartSize:         partSize,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	declared := uploadAllParts(t, svc, session.ID, map[int][]byte{
+		1: bytes.Repeat([]byte("a"), partSize),
+		2: bytes.Repeat([]byte("b"), 1024),
+	})
+	// Forge the second part's ETag.
+	for i := range declared {
+		if declared[i].PartNumber == 2 {
+			declared[i].ETag = "\"deadbeefdeadbeefdeadbeefdeadbeef\""
+		}
+	}
+
+	if _, _, err := svc.Complete(ctx, session.ID, declared); !errors.Is(err, uploads.ErrChecksumMismatch) {
+		t.Fatalf("expected ErrChecksumMismatch, got %v", err)
+	}
+
+	var videoCount, outboxCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM videos`).Scan(&videoCount); err != nil {
+		t.Fatalf("count videos: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM outbox_messages`).Scan(&outboxCount); err != nil {
+		t.Fatalf("count outbox: %v", err)
+	}
+	if videoCount != 0 || outboxCount != 0 {
+		t.Fatalf("tampered completion must create nothing; videos=%d outbox=%d", videoCount, outboxCount)
+	}
+
+	// The session is still resumable (not completed).
+	var sessStatus string
+	if err := db.QueryRowContext(ctx,
+		`SELECT status FROM upload_sessions WHERE id = $1`, session.ID).Scan(&sessStatus); err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	if sessStatus == "completed" {
+		t.Fatal("session must not be completed after a tampered-part failure")
+	}
+}
+
+// uploadAllParts PUTs each part via a presigned URL and returns the declared
+// (partNumber, etag) list the client would send to complete.
+func uploadAllParts(t *testing.T, svc *uploads.Service, sessionID string, parts map[int][]byte) []uploads.CompletePart {
+	t.Helper()
+	declared := make([]uploads.CompletePart, 0, len(parts))
+	for n, body := range parts {
+		url, _, err := svc.PartURL(context.Background(), sessionID, n)
+		if err != nil {
+			t.Fatalf("part %d url: %v", n, err)
+		}
+		etag := putPart(t, url, body)
+		if etag == "" {
+			t.Fatalf("part %d: missing ETag", n)
+		}
+		declared = append(declared, uploads.CompletePart{PartNumber: n, ETag: etag})
+	}
+	return declared
 }
 
 // TestUploadSessionAbortReleasesMultipart proves abort tears down the multipart

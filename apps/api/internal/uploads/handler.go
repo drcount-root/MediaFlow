@@ -20,6 +20,7 @@ func (h *Handler) RegisterRoutes(router gin.IRouter) {
 	router.POST("/uploads", h.create)
 	router.GET("/uploads/:id", h.get)
 	router.GET("/uploads/:id/parts/:n/url", h.partURL)
+	router.POST("/uploads/:id/complete", h.complete)
 	router.DELETE("/uploads/:id", h.abort)
 }
 
@@ -87,6 +88,30 @@ func (h *Handler) partURL(ctx *gin.Context) {
 	})
 }
 
+type completeRequest struct {
+	Parts []CompletePart `json:"parts"`
+}
+
+func (h *Handler) complete(ctx *gin.Context) {
+	var req completeRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		writeError(ctx, http.StatusBadRequest, "invalid_input", "A valid JSON body with parts is required.")
+		return
+	}
+
+	videoID, created, err := h.service.Complete(ctx.Request.Context(), ctx.Param("id"), req.Parts)
+	if err != nil {
+		writeServiceError(ctx, err)
+		return
+	}
+
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	ctx.JSON(status, gin.H{"videoId": videoID, "status": "queued"})
+}
+
 func (h *Handler) abort(ctx *gin.Context) {
 	if err := h.service.Abort(ctx.Request.Context(), ctx.Param("id")); err != nil {
 		writeServiceError(ctx, err)
@@ -107,6 +132,12 @@ func writeServiceError(ctx *gin.Context, err error) {
 		writeError(ctx, http.StatusNotFound, "upload_not_found", "Upload session not found.")
 	case errors.Is(err, ErrConflict):
 		writeError(ctx, http.StatusConflict, "upload_conflict", "The upload session is not in a state that allows this action.")
+	case errors.Is(err, ErrIncompleteUpload):
+		writeError(ctx, http.StatusUnprocessableEntity, "upload_incomplete", "The upload is missing one or more parts.")
+	case errors.Is(err, ErrChecksumMismatch):
+		writeError(ctx, http.StatusUnprocessableEntity, "checksum_mismatch", "A part does not match the uploaded data.")
+	case errors.Is(err, ErrSizeMismatch):
+		writeError(ctx, http.StatusUnprocessableEntity, "size_mismatch", "The uploaded size does not match the declared size.")
 	default:
 		writeError(ctx, http.StatusInternalServerError, "internal_error", "Unexpected server error.")
 	}

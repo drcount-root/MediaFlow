@@ -33,6 +33,15 @@ var (
 	// ErrConflict means the session is not in a state that allows the requested
 	// action (e.g. asking for a part URL on a completed or aborted session).
 	ErrConflict = errors.New("upload session not in a usable state")
+	// ErrIncompleteUpload means object storage is missing parts the session
+	// expects (the client never finished uploading).
+	ErrIncompleteUpload = errors.New("upload is missing parts")
+	// ErrChecksumMismatch means a declared part ETag does not match the part
+	// object storage actually holds — a tampered or re-uploaded part.
+	ErrChecksumMismatch = errors.New("part checksum mismatch")
+	// ErrSizeMismatch means the assembled object size differs from the size the
+	// client declared at session creation.
+	ErrSizeMismatch = errors.New("assembled size does not match declared size")
 )
 
 // Session is a multipart upload in progress (or finished). UploadedParts is only
@@ -78,6 +87,31 @@ type CreateParams struct {
 	ChecksumSHA256   string
 }
 
+// CompletePart is a client-declared (partNumber, etag) pair, validated against
+// what object storage holds before the multipart upload is finalized.
+type CompletePart struct {
+	PartNumber int    `json:"partNumber"`
+	ETag       string `json:"etag"`
+}
+
+// CompleteSessionParams is the atomic completion the repository persists: the
+// video/job/events/outbox rows (reusing the M5 machinery) plus marking the
+// session completed and linking it to the new video — all in one transaction.
+type CompleteSessionParams struct {
+	SessionID         string
+	VideoID           string
+	JobID             string
+	Title             string
+	Description       *string
+	RawObjectKey      string
+	OriginalFilename  string
+	ContentType       string
+	SizeBytes         int64
+	OutboxExchange    string
+	OutboxRoutingKey  string
+	OutboxPayloadJSON []byte
+}
+
 // CreateSessionParams is the fully-resolved row the repository persists.
 type CreateSessionParams struct {
 	ID               string
@@ -98,6 +132,7 @@ type Repository interface {
 	CreateSession(ctx context.Context, params CreateSessionParams) (Session, error)
 	GetSession(ctx context.Context, id string) (Session, error)
 	SetSessionStatus(ctx context.Context, id, status string) error
+	CompleteSession(ctx context.Context, params CompleteSessionParams) error
 }
 
 // ObjectStorage is the multipart surface the service needs from MinIO. The
@@ -106,5 +141,6 @@ type ObjectStorage interface {
 	InitiateMultipart(ctx context.Context, objectKey, contentType string) (uploadID string, err error)
 	PresignPartURL(ctx context.Context, objectKey, uploadID string, partNumber int, expires time.Duration) (string, error)
 	ListParts(ctx context.Context, objectKey, uploadID string) ([]UploadedPart, error)
+	CompleteMultipart(ctx context.Context, objectKey, uploadID string, parts []CompletePart) error
 	AbortMultipart(ctx context.Context, objectKey, uploadID string) error
 }

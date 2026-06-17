@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"mediaflow/apps/api/internal/uploads"
+	"mediaflow/apps/api/internal/videos"
 )
 
 // Milestone 6 upload-session persistence. PostgresRepository implements
@@ -65,6 +66,77 @@ func (r *PostgresRepository) SetSessionStatus(ctx context.Context, id, status st
 		return uploads.ErrNotFound
 	}
 	return nil
+}
+
+// CompleteSession finalizes an upload in one transaction: it creates the video
+// (status queued), its transcode job, the lifecycle events, and the outbox
+// message — exactly like videos.CreateQueuedVideo — and marks the session
+// completed and linked to the new video. Either all of it commits or none does,
+// so a session can never end up completed without an enqueued job (or vice
+// versa).
+func (r *PostgresRepository) CompleteSession(ctx context.Context, params uploads.CompleteSessionParams) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO videos (
+			id, title, description, status, raw_object_key,
+			original_filename, content_type, size_bytes
+		)
+		VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
+	`, params.VideoID, params.Title, params.Description, params.RawObjectKey,
+		params.OriginalFilename, params.ContentType, params.SizeBytes)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO video_jobs (id, video_id, job_type, status)
+		VALUES ($1, $2, $3, 'queued')
+	`, params.JobID, params.VideoID, videos.JobTypeTranscode)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO video_events (video_id, event_type, message, metadata_json)
+		VALUES
+			($1, 'video.upload.completed', 'Multipart upload completed to object storage.', jsonb_build_object('rawObjectKey', $2::text)),
+			($1, 'video.job.queued', 'Transcode job queued.', jsonb_build_object('jobId', $3::text))
+	`, params.VideoID, params.RawObjectKey, params.JobID)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO outbox_messages (exchange, routing_key, payload_json)
+		VALUES ($1, $2, $3)
+	`, params.OutboxExchange, params.OutboxRoutingKey, params.OutboxPayloadJSON)
+	if err != nil {
+		return err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE upload_sessions
+		SET status = 'completed', video_id = $2, updated_at = now()
+		WHERE id = $1 AND status IN ('pending', 'uploading')
+	`, params.SessionID, params.VideoID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	// Another completion won the race (session no longer pending/uploading).
+	if affected == 0 {
+		return uploads.ErrConflict
+	}
+
+	return tx.Commit()
 }
 
 func scanSession(row interface{ Scan(...any) error }) (uploads.Session, error) {

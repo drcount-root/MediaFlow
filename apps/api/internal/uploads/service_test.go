@@ -67,9 +67,24 @@ func (f *fakeRepo) SetSessionStatus(_ context.Context, id, status string) error 
 	return nil
 }
 
+func (f *fakeRepo) CompleteSession(_ context.Context, p CompleteSessionParams) error {
+	s, ok := f.sessions[p.SessionID]
+	if !ok {
+		return ErrNotFound
+	}
+	if s.Status != StatusPending && s.Status != StatusUploading {
+		return ErrConflict
+	}
+	s.Status = StatusCompleted
+	s.VideoID = &p.VideoID
+	f.sessions[p.SessionID] = s
+	return nil
+}
+
 type fakeStorage struct {
 	initiated    int
 	aborted      int
+	completed    int
 	parts        []UploadedPart
 	failInitiate bool
 }
@@ -90,13 +105,18 @@ func (f *fakeStorage) ListParts(_ context.Context, _, _ string) ([]UploadedPart,
 	return f.parts, nil
 }
 
+func (f *fakeStorage) CompleteMultipart(_ context.Context, _, _ string, _ []CompletePart) error {
+	f.completed++
+	return nil
+}
+
 func (f *fakeStorage) AbortMultipart(_ context.Context, _, _ string) error {
 	f.aborted++
 	return nil
 }
 
 func newService(repo Repository, storage ObjectStorage) *Service {
-	return NewService(repo, storage, testMaxUpload, testSessionTTL, testPartTTL)
+	return NewService(repo, storage, "mediaflow-raw", testMaxUpload, testSessionTTL, testPartTTL)
 }
 
 func validCreate() CreateParams {
@@ -265,6 +285,104 @@ func TestAbortReleasesMultipartAndIsIdempotent(t *testing.T) {
 	}
 	if storage.aborted != 1 {
 		t.Fatalf("second abort should be a no-op, aborted=%d", storage.aborted)
+	}
+}
+
+// completeFixture creates a 2-part session and stocks storage with two matching
+// 5 MiB parts so the declared parts line up with what storage "holds".
+func completeFixture(t *testing.T) (*Service, *fakeRepo, *fakeStorage, string, []CompletePart) {
+	t.Helper()
+	repo := newFakeRepo()
+	storage := &fakeStorage{parts: []UploadedPart{
+		{PartNumber: 1, ETag: "etag1", Size: 5 * mib},
+		{PartNumber: 2, ETag: "etag2", Size: 5 * mib},
+	}}
+	svc := newService(repo, storage)
+	session, err := svc.Create(context.Background(), validCreate()) // total 10MiB, 2 parts
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	declared := []CompletePart{{PartNumber: 1, ETag: "etag1"}, {PartNumber: 2, ETag: "etag2"}}
+	return svc, repo, storage, session.ID, declared
+}
+
+func TestCompleteFinalizesAndEnqueues(t *testing.T) {
+	svc, repo, storage, id, declared := completeFixture(t)
+
+	videoID, created, err := svc.Complete(context.Background(), id, declared)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if !created {
+		t.Fatal("expected created=true on first completion")
+	}
+	if videoID == "" {
+		t.Fatal("expected a video id")
+	}
+	if storage.completed != 1 {
+		t.Fatalf("expected multipart completed once, got %d", storage.completed)
+	}
+	if got := repo.sessions[id].Status; got != StatusCompleted {
+		t.Fatalf("expected session completed, got %q", got)
+	}
+}
+
+func TestCompleteReplaysWhenAlreadyCompleted(t *testing.T) {
+	svc, _, storage, id, declared := completeFixture(t)
+
+	first, _, err := svc.Complete(context.Background(), id, declared)
+	if err != nil {
+		t.Fatalf("first complete: %v", err)
+	}
+	second, created, err := svc.Complete(context.Background(), id, declared)
+	if err != nil {
+		t.Fatalf("second complete: %v", err)
+	}
+	if created {
+		t.Fatal("expected created=false on replay")
+	}
+	if second != first {
+		t.Fatalf("replay returned a different video id: %s vs %s", second, first)
+	}
+	if storage.completed != 1 {
+		t.Fatalf("replay must not re-finalize the multipart, completed=%d", storage.completed)
+	}
+}
+
+func TestCompleteRejectsChecksumMismatch(t *testing.T) {
+	svc, _, storage, id, _ := completeFixture(t)
+	bad := []CompletePart{{PartNumber: 1, ETag: "etag1"}, {PartNumber: 2, ETag: "WRONG"}}
+
+	if _, _, err := svc.Complete(context.Background(), id, bad); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("expected ErrChecksumMismatch, got %v", err)
+	}
+	if storage.completed != 0 {
+		t.Fatalf("multipart must not be finalized on checksum mismatch, completed=%d", storage.completed)
+	}
+}
+
+func TestCompleteRejectsMissingParts(t *testing.T) {
+	svc, _, _, id, _ := completeFixture(t)
+	short := []CompletePart{{PartNumber: 1, ETag: "etag1"}}
+
+	if _, _, err := svc.Complete(context.Background(), id, short); !errors.Is(err, ErrIncompleteUpload) {
+		t.Fatalf("expected ErrIncompleteUpload, got %v", err)
+	}
+}
+
+func TestCompleteRejectsSizeMismatch(t *testing.T) {
+	svc, _, storage, id, declared := completeFixture(t)
+	// Stored part 2 is smaller than declared -> assembled size != declared total.
+	storage.parts = []UploadedPart{
+		{PartNumber: 1, ETag: "etag1", Size: 5 * mib},
+		{PartNumber: 2, ETag: "etag2", Size: 4 * mib},
+	}
+
+	if _, _, err := svc.Complete(context.Background(), id, declared); !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("expected ErrSizeMismatch, got %v", err)
+	}
+	if storage.completed != 0 {
+		t.Fatalf("multipart must not be finalized on size mismatch, completed=%d", storage.completed)
 	}
 }
 

@@ -57,7 +57,7 @@ func main() {
 
 	repo := database.NewPostgresRepository(db)
 	videoService := videos.NewService(repo, objectStorage, cfg.MinIORawBucket, cfg.MaxUploadBytes)
-	uploadService := uploads.NewService(repo, objectStorage, cfg.MaxUploadBytes, cfg.UploadSessionTTL, cfg.UploadPartURLTTL)
+	uploadService := uploads.NewService(repo, objectStorage, cfg.MinIORawBucket, cfg.MaxUploadBytes, cfg.UploadSessionTTL, cfg.UploadPartURLTTL)
 
 	// The outbox relay is what actually publishes transcode jobs; the request
 	// path only writes the outbox row. Run it for the lifetime of the process.

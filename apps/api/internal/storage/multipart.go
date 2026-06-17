@@ -65,6 +65,17 @@ func (s *MinIOStorage) ListParts(ctx context.Context, objectKey, uploadID string
 	return parts, nil
 }
 
+// CompleteMultipart finalizes a multipart upload by concatenating the named
+// parts (in order) into the object.
+func (s *MinIOStorage) CompleteMultipart(ctx context.Context, objectKey, uploadID string, parts []uploads.CompletePart) error {
+	cp := make([]minio.CompletePart, len(parts))
+	for i, p := range parts {
+		cp[i] = minio.CompletePart{PartNumber: p.PartNumber, ETag: p.ETag}
+	}
+	_, err := s.core().CompleteMultipartUpload(ctx, s.rawBucket, objectKey, uploadID, cp, minio.PutObjectOptions{})
+	return err
+}
+
 // AbortMultipart releases an in-progress multipart upload and its staged parts.
 func (s *MinIOStorage) AbortMultipart(ctx context.Context, objectKey, uploadID string) error {
 	return s.core().AbortMultipartUpload(ctx, s.rawBucket, objectKey, uploadID)

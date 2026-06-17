@@ -2,25 +2,30 @@ package uploads
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"mediaflow/apps/api/internal/videos"
 )
 
 type Service struct {
 	repo           Repository
 	storage        ObjectStorage
+	rawBucket      string
 	maxUploadBytes int64
 	sessionTTL     time.Duration
 	partURLTTL     time.Duration
 }
 
-func NewService(repo Repository, storage ObjectStorage, maxUploadBytes int64, sessionTTL, partURLTTL time.Duration) *Service {
+func NewService(repo Repository, storage ObjectStorage, rawBucket string, maxUploadBytes int64, sessionTTL, partURLTTL time.Duration) *Service {
 	return &Service{
 		repo:           repo,
 		storage:        storage,
+		rawBucket:      rawBucket,
 		maxUploadBytes: maxUploadBytes,
 		sessionTTL:     sessionTTL,
 		partURLTTL:     partURLTTL,
@@ -125,6 +130,111 @@ func (s *Service) PartURL(ctx context.Context, id string, partNumber int) (strin
 	return url, time.Now().UTC().Add(s.partURLTTL), nil
 }
 
+// Complete validates the uploaded parts against what object storage actually
+// holds, finalizes the multipart upload, and — in one transaction — creates the
+// video/job/outbox rows (reusing the M5 enqueue) and marks the session
+// completed. The returned bool is true when this call created the video and
+// false when a prior completion is being replayed (idempotent).
+func (s *Service) Complete(ctx context.Context, id string, declared []CompletePart) (videoID string, created bool, err error) {
+	session, err := s.repo.GetSession(ctx, id)
+	if err != nil {
+		return "", false, err
+	}
+	// Replay: already completed -> return the existing video.
+	if session.Status == StatusCompleted {
+		if session.VideoID == nil {
+			return "", false, ErrConflict
+		}
+		return *session.VideoID, false, nil
+	}
+	if session.Status != StatusPending && session.Status != StatusUploading {
+		return "", false, ErrConflict
+	}
+
+	// What object storage actually holds, keyed by part number.
+	actualParts, err := s.storage.ListParts(ctx, session.ObjectKey, session.UploadID)
+	if err != nil {
+		return "", false, err
+	}
+	actual := make(map[int]UploadedPart, len(actualParts))
+	for _, p := range actualParts {
+		actual[p.PartNumber] = p
+	}
+
+	// Every expected part must be present and its declared ETag must match the
+	// stored part. We rebuild the complete list from the stored ETags so the
+	// finalize call can never use a client-forged value.
+	if len(declared) != session.PartCount {
+		return "", false, ErrIncompleteUpload
+	}
+	declaredETag := make(map[int]string, len(declared))
+	for _, d := range declared {
+		declaredETag[d.PartNumber] = normalizeETag(d.ETag)
+	}
+
+	var total int64
+	complete := make([]CompletePart, 0, session.PartCount)
+	for n := 1; n <= session.PartCount; n++ {
+		stored, ok := actual[n]
+		if !ok {
+			return "", false, ErrIncompleteUpload
+		}
+		want, ok := declaredETag[n]
+		if !ok {
+			return "", false, ErrIncompleteUpload
+		}
+		if want != normalizeETag(stored.ETag) {
+			return "", false, ErrChecksumMismatch
+		}
+		total += stored.Size
+		complete = append(complete, CompletePart{PartNumber: n, ETag: stored.ETag})
+	}
+
+	if total != session.TotalSize {
+		return "", false, ErrSizeMismatch
+	}
+	if s.maxUploadBytes > 0 && total > s.maxUploadBytes {
+		return "", false, ErrTooLarge
+	}
+
+	sort.Slice(complete, func(i, j int) bool { return complete[i].PartNumber < complete[j].PartNumber })
+	if err := s.storage.CompleteMultipart(ctx, session.ObjectKey, session.UploadID, complete); err != nil {
+		return "", false, err
+	}
+
+	newVideoID := uuid.NewString()
+	jobID := uuid.NewString()
+	payload, err := json.Marshal(videos.TranscodeJob{
+		JobID:        jobID,
+		VideoID:      newVideoID,
+		RawBucket:    s.rawBucket,
+		RawObjectKey: session.ObjectKey,
+		RequestedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return "", false, err
+	}
+
+	if err := s.repo.CompleteSession(ctx, CompleteSessionParams{
+		SessionID:         session.ID,
+		VideoID:           newVideoID,
+		JobID:             jobID,
+		Title:             session.Title,
+		Description:       session.Description,
+		RawObjectKey:      session.ObjectKey,
+		OriginalFilename:  session.OriginalFilename,
+		ContentType:       session.ContentType,
+		SizeBytes:         total,
+		OutboxExchange:    videos.VideoExchange,
+		OutboxRoutingKey:  videos.TranscodeRoutingKey,
+		OutboxPayloadJSON: payload,
+	}); err != nil {
+		return "", false, err
+	}
+
+	return newVideoID, true, nil
+}
+
 // Abort cancels an in-progress upload and releases the multipart upload in object
 // storage. Completed sessions cannot be aborted; already-aborted ones are a no-op.
 func (s *Service) Abort(ctx context.Context, id string) error {
@@ -143,6 +253,13 @@ func (s *Service) Abort(ctx context.Context, id string) error {
 		return err
 	}
 	return s.repo.SetSessionStatus(ctx, id, StatusAborted)
+}
+
+// normalizeETag strips surrounding quotes and lowercases an ETag so values from
+// a PUT response header (quoted) and from ListObjectParts (unquoted) compare
+// equal.
+func normalizeETag(etag string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(etag), `"`))
 }
 
 func optionalString(value string) *string {

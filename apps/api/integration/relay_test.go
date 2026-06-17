@@ -4,9 +4,12 @@ package integration
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
@@ -88,6 +91,135 @@ func TestRelayDeliversOutboxToQueue(t *testing.T) {
 			t.Fatal("outbox row was not marked published within 5s")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestRelayReconnectsAfterBrokerDrop proves the publisher recovers when the
+// broker connection is lost and restored. This is the regression guard for the
+// "RabbitMQ-down-during-upload" drill: without lazy reconnect the relay would
+// stay wedged on a dead channel and videos would be stuck in `queued` forever.
+func TestRelayReconnectsAfterBrokerDrop(t *testing.T) {
+	db := openDB(t)
+	truncateAll(t, db)
+	drainTranscodeQueue(t)
+	ctx := context.Background()
+
+	publisher, err := queue.NewRabbitPublisher(infra.rabbitURL)
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	relay := outbox.NewRelay(db, publisher, slog.New(slog.NewTextHandler(io.Discard, nil)), 50*time.Millisecond, 10)
+	relayCtx, cancel := context.WithCancel(ctx)
+	relayDone := make(chan struct{})
+	go func() {
+		relay.Run(relayCtx)
+		close(relayDone)
+	}()
+	defer func() {
+		cancel()
+		<-relayDone
+	}()
+
+	// First message establishes a live broker connection.
+	first := enqueueOutboxJob(t, db)
+	got := consumeOneTranscodeJob(t, 10*time.Second)
+	if got.JobID != first {
+		t.Fatalf("first delivery mismatch: want %s, got %s", first, got.JobID)
+	}
+
+	// Force the broker to drop every client connection — the publisher's channel
+	// is now dead, exactly as it would be after a broker restart.
+	closeAllRabbitConnections(t)
+
+	// A new message after the drop must still be delivered: the publisher should
+	// notice the closed connection on its next tick and redial transparently.
+	second := enqueueOutboxJob(t, db)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		got := consumeOneTranscodeJob(t, 10*time.Second)
+		if got.JobID == second {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("relay did not redeliver after broker drop; last got %s, want %s", got.JobID, second)
+		}
+	}
+}
+
+// enqueueOutboxJob inserts an unpublished outbox row carrying a transcode job and
+// returns the job ID so the test can match the delivered message.
+func enqueueOutboxJob(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	jobID := uuid.NewString()
+	payload, err := json.Marshal(videos.TranscodeJob{
+		JobID:        jobID,
+		VideoID:      uuid.NewString(),
+		RawBucket:    rawBucket,
+		RawObjectKey: "raw-videos/" + jobID + "/original.mp4",
+		RequestedAt:  time.Now().UTC().Truncate(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("marshal job: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO outbox_messages (exchange, routing_key, payload_json)
+		VALUES ($1, $2, $3)
+	`, videos.VideoExchange, videos.TranscodeRoutingKey, payload); err != nil {
+		t.Fatalf("insert outbox row: %v", err)
+	}
+	return jobID
+}
+
+// closeAllRabbitConnections force-closes every open AMQP connection via the
+// management HTTP API, simulating a broker restart from the client's point of
+// view (the client connection transitions to closed).
+func closeAllRabbitConnections(t *testing.T) {
+	t.Helper()
+	type conn struct {
+		Name string `json:"name"`
+	}
+	// The management plugin's connection list is eventually consistent, so poll
+	// until the publisher's connection shows up before closing it.
+	var conns []conn
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		req, err := http.NewRequest(http.MethodGet, infra.rabbitMgmtURL+"/api/connections", nil)
+		if err != nil {
+			t.Fatalf("build list-connections request: %v", err)
+		}
+		req.SetBasicAuth("mediaflow", "mediaflow")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("list connections: %v", err)
+		}
+		err = json.NewDecoder(resp.Body).Decode(&conns)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("decode connections: %v", err)
+		}
+		if len(conns) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no open broker connections appeared in the management API to close")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	for _, c := range conns {
+		del, err := http.NewRequest(http.MethodDelete,
+			infra.rabbitMgmtURL+"/api/connections/"+url.PathEscape(c.Name), nil)
+		if err != nil {
+			t.Fatalf("build delete-connection request: %v", err)
+		}
+		del.SetBasicAuth("mediaflow", "mediaflow")
+		del.Header.Set("X-Reason", "drill: simulated broker drop")
+		dr, err := http.DefaultClient.Do(del)
+		if err != nil {
+			t.Fatalf("close connection %s: %v", c.Name, err)
+		}
+		dr.Body.Close()
 	}
 }
 

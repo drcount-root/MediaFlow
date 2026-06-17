@@ -242,7 +242,7 @@ func openDB(t *testing.T) *sql.DB {
 func truncateAll(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.ExecContext(context.Background(),
-		`TRUNCATE videos, video_jobs, video_variants, video_events, outbox_messages RESTART IDENTITY CASCADE`)
+		`TRUNCATE upload_sessions, videos, video_jobs, video_variants, video_events, outbox_messages RESTART IDENTITY CASCADE`)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

@@ -9,10 +9,13 @@ Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in
 Current focus:
 
 ```txt
-Milestone 5: Correctness Under Failure — COMPLETE
-slices A (outbox) + B (leases+reaper) + C (retries/DLQ) + D (idempotency+shutdown) done
-RabbitMQ-down drill ran: exposed a relay that never reconnected; fixed with a
-lazy-reconnecting publisher (ADR 0006); drill re-run green. Next: Milestone 6.
+Milestone 5: Correctness Under Failure — COMPLETE (ADRs 0002–0006)
+Milestone 6: Scalable Ingest — in progress
+  slice A (sessions + presigned parts) done: upload_sessions table, multipart
+    control-plane endpoints, presigned part URLs, resume via object storage
+    (ADR 0007). Bytes already bypass the API in the integration round-trip.
+  next: slice B (completion + validation + enqueue), then C (expiry sweep),
+    D (web uploader + retire legacy proxy).
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -27,7 +30,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
 | 4. CI and Integration Test Harness | Done | GitHub Actions + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow). CI green on PR #1 and required via a ruleset on a public, protected `main`. ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
 | 5. Correctness Under Failure | Done | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `0004`). Slice D (idempotency+shutdown) done: `Idempotency-Key` on upload (partial unique index, replay returns original with 200, race recovers via 23505), graceful SIGTERM (drain in-flight job within `WORKER_SHUTDOWN_GRACE`, reaper covers overruns), retry hygiene verified (skip-if-ready, variant clear, deterministic keys) (ADR `docs/adr/0005-idempotency-and-graceful-shutdown.md`). RabbitMQ-down drill done: upload stays 201 with the broker down (request path is broker-independent); the drill exposed a relay that held one connection for life and never recovered, fixed with a lazy-reconnecting publisher so the outbox drains automatically on broker return — no API restart (ADR `docs/adr/0006-relay-broker-reconnect.md`). |
-| 6. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
+| 6. Scalable Ingest | In progress | Slice A (sessions + presigned parts) done: `upload_sessions` table (migration `000005`, status enum `pending\|uploading\|completed\|aborted\|expired`), control-plane endpoints (`POST /uploads`, `GET /uploads/:id`, `GET /uploads/:id/parts/:n/url`, `DELETE /uploads/:id`), MinIO multipart via `minio.Core`, size/part validation at creation, resume by listing parts from object storage; integration round-trip PUTs parts straight to MinIO (bytes bypass the API) (ADR `docs/adr/0007-presigned-multipart-ingest.md`). Remaining: completion+validation+enqueue, expiry sweep, web uploader, retire legacy proxy. |
 | 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
 | 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
 | 9. Observability | Not started | OpenTelemetry traces across the queue, Prometheus metrics, Jaeger + Grafana dashboards. |
@@ -156,19 +159,19 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 
 ### Milestone 6: Scalable Ingest
 
-- [ ] Add migration `000003`: `upload_sessions` table
-- [ ] `POST /uploads`: create session, initiate MinIO multipart upload
-- [ ] `GET /uploads/:id/parts/:n/url`: issue presigned part URL
-- [ ] `GET /uploads/:id`: report session status and uploaded parts for resume
+- [x] Add migration `000005`: `upload_sessions` table (plan said `000003`; renumbered — M5 added `000002`–`000004`)
+- [x] `POST /uploads`: create session, initiate MinIO multipart upload
+- [x] `GET /uploads/:id/parts/:n/url`: issue presigned part URL
+- [x] `GET /uploads/:id`: report session status and uploaded parts for resume
 - [ ] `POST /uploads/:id/complete`: complete multipart, validate size and checksums, enqueue via outbox
-- [ ] `DELETE /uploads/:id`: abort multipart upload
+- [x] `DELETE /uploads/:id`: abort multipart upload
 - [ ] Cleanup loop: abort expired sessions and orphaned multipart uploads
-- [ ] Enforce size limits at session creation and at completion
+- [~] Enforce size limits at session creation and at completion (creation done; completion in slice B)
 - [ ] Web: chunked uploader with bounded parallelism and per-part retry
 - [ ] Web: resume upload after page reload (persist session id)
 - [ ] Web: real upload progress UI
 - [ ] Remove (or flag-gate) legacy `POST /videos/upload` proxy endpoint
-- [ ] Tests: session lifecycle, resume, checksum mismatch, oversize rejection
+- [~] Tests: session lifecycle, resume, checksum mismatch, oversize rejection (lifecycle/resume/oversize done in slice A; checksum mismatch in slice B)
 - [ ] Verify: 500MB upload never transits the API process
 
 ### Milestone 7: Distributed Transcoding

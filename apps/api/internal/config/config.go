@@ -22,6 +22,8 @@ type Config struct {
 	MaxUploadBytes       int64
 	OutboxPollInterval   time.Duration
 	OutboxBatchSize      int
+	UploadSessionTTL     time.Duration
+	UploadPartURLTTL     time.Duration
 }
 
 func Load() Config {
@@ -41,6 +43,8 @@ func Load() Config {
 		MaxUploadBytes:       getInt64Env("MAX_UPLOAD_BYTES", 524288000),
 		OutboxPollInterval:   getDurationEnv("OUTBOX_POLL_INTERVAL", time.Second),
 		OutboxBatchSize:      int(getInt64Env("OUTBOX_BATCH_SIZE", 100)),
+		UploadSessionTTL:     getDurationEnv("UPLOAD_SESSION_TTL", 24*time.Hour),
+		UploadPartURLTTL:     getDurationEnv("UPLOAD_PART_URL_TTL", time.Hour),
 	}
 }
 

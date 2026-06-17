@@ -27,10 +27,11 @@ out/
 bin/
 *.test
 
-# Local media/output
-tmp/
-uploads/
-processed/
+# Local media/output (repo-root only — must not match Go source packages like
+# apps/api/internal/uploads/)
+/tmp/
+/uploads/
+/processed/
 *.mp4
 *.mov
 *.mkv

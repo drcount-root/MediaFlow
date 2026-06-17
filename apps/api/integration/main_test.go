@@ -44,6 +44,7 @@ const (
 var infra struct {
 	databaseURL    string
 	rabbitURL      string
+	rabbitMgmtURL  string
 	minioEndpoint  string
 	minioAccessKey string
 	minioSecretKey string
@@ -108,6 +109,10 @@ func startInfra(ctx context.Context) (func(), error) {
 	infra.rabbitURL, err = rabbit.AmqpURL(ctx)
 	if err != nil {
 		return terminate, fmt.Errorf("rabbitmq amqp url: %w", err)
+	}
+	infra.rabbitMgmtURL, err = rabbit.HttpURL(ctx)
+	if err != nil {
+		return terminate, fmt.Errorf("rabbitmq management url: %w", err)
 	}
 
 	mc, err := tcminio.Run(ctx, "minio/minio:latest",

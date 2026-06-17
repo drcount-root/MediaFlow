@@ -1,17 +1,18 @@
 # MediaFlow Progress Tracker
 
-Last updated: 2026-06-13
+Last updated: 2026-06-17
 
 ## Overall Status
 
-Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestone 4 done (CI green and enforced on a protected, public `main`). Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
+Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestones 4 and 5 done. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
 
 Current focus:
 
 ```txt
-Milestone 5: Correctness Under Failure
-slices A (outbox) + B (leases+reaper) + C (retries/DLQ) + D (idempotency+shutdown) — done
-remaining: RabbitMQ-down-during-upload failure drill, then M5 complete
+Milestone 5: Correctness Under Failure — COMPLETE
+slices A (outbox) + B (leases+reaper) + C (retries/DLQ) + D (idempotency+shutdown) done
+RabbitMQ-down drill ran: exposed a relay that never reconnected; fixed with a
+lazy-reconnecting publisher (ADR 0006); drill re-run green. Next: Milestone 6.
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -25,7 +26,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 2. Worker Transcoding Path | Done | Worker consumes jobs, runs FFmpeg/ffprobe, creates thumbnail and HLS variants, uploads outputs, and marks videos ready. |
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
 | 4. CI and Integration Test Harness | Done | GitHub Actions + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow). CI green on PR #1 and required via a ruleset on a public, protected `main`. ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
-| 5. Correctness Under Failure | In progress | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `0004`). Slice D (idempotency+shutdown) done: `Idempotency-Key` on upload (partial unique index, replay returns original with 200, race recovers via 23505), graceful SIGTERM (drain in-flight job within `WORKER_SHUTDOWN_GRACE`, reaper covers overruns), retry hygiene verified (skip-if-ready, variant clear, deterministic keys) (ADR `docs/adr/0005-idempotency-and-graceful-shutdown.md`). Remaining: RabbitMQ-down-during-upload drill. |
+| 5. Correctness Under Failure | Done | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `0004`). Slice D (idempotency+shutdown) done: `Idempotency-Key` on upload (partial unique index, replay returns original with 200, race recovers via 23505), graceful SIGTERM (drain in-flight job within `WORKER_SHUTDOWN_GRACE`, reaper covers overruns), retry hygiene verified (skip-if-ready, variant clear, deterministic keys) (ADR `docs/adr/0005-idempotency-and-graceful-shutdown.md`). RabbitMQ-down drill done: upload stays 201 with the broker down (request path is broker-independent); the drill exposed a relay that held one connection for life and never recovered, fixed with a lazy-reconnecting publisher so the outbox drains automatically on broker return — no API restart (ADR `docs/adr/0006-relay-broker-reconnect.md`). |
 | 6. Scalable Ingest | Not started | Presigned multipart direct-to-MinIO uploads, resumable, checksummed. API becomes control plane only. |
 | 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
 | 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
@@ -150,7 +151,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 - [x] Write `video_events` row on every status transition
 - [x] Tests (incl. integration): outbox relay, claim/lease, retry routing, reaper, idempotency key
 - [x] Failure drill: `kill -9` worker mid-job → reaper recovers → video `ready` (2026-06-13: two-worker run, killed the claimer mid-download with the lease held; the survivor's reaper logged `requeued=1` ~16s later, reclaimed as attempt 2, drove the video to `ready`; `video.job.requeued` event recorded and the requeue flowed through the outbox)
-- [ ] Failure drill: RabbitMQ down during upload → outbox drains after restart
+- [x] Failure drill: RabbitMQ down during upload → outbox drains after restart (2026-06-17: with the broker stopped, `POST /videos/upload` still returned 201 and the outbox row persisted; the drill exposed a publisher that dialed once at startup and never reconnected — the relay looped on a dead channel even after the broker came back. Fixed with a lazy-reconnecting publisher (`ensureChannel` redials on a closed conn/channel); re-ran the drill and the outbox drained on the next tick with no API restart. Regression guard: integration `TestRelayReconnectsAfterBrokerDrop`. ADR `docs/adr/0006-relay-broker-reconnect.md`)
 - [x] Failure drill: poison message lands in DLQ without wedging the consumer (integration `TestPoisonMessageDeadLettered`: unparseable body → DLQ with `x-failure-reason`, then a valid job still reaches `ready` — real RabbitMQ via testcontainers)
 
 ### Milestone 6: Scalable Ingest

@@ -24,6 +24,8 @@ type Config struct {
 	OutboxBatchSize      int
 	UploadSessionTTL     time.Duration
 	UploadPartURLTTL     time.Duration
+	UploadSweepInterval  time.Duration
+	UploadSweepBatchSize int
 }
 
 func Load() Config {
@@ -45,6 +47,8 @@ func Load() Config {
 		OutboxBatchSize:      int(getInt64Env("OUTBOX_BATCH_SIZE", 100)),
 		UploadSessionTTL:     getDurationEnv("UPLOAD_SESSION_TTL", 24*time.Hour),
 		UploadPartURLTTL:     getDurationEnv("UPLOAD_PART_URL_TTL", time.Hour),
+		UploadSweepInterval:  getDurationEnv("UPLOAD_SWEEP_INTERVAL", 5*time.Minute),
+		UploadSweepBatchSize: int(getInt64Env("UPLOAD_SWEEP_BATCH_SIZE", 100)),
 	}
 }
 

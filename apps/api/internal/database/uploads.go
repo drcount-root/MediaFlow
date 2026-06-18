@@ -139,6 +139,53 @@ func (r *PostgresRepository) CompleteSession(ctx context.Context, params uploads
 	return tx.Commit()
 }
 
+// ListExpiredSessions returns sessions past their deadline that are still open
+// (pending/uploading), so the sweeper can release their multipart uploads. The
+// expires_at predicate is index-backed (idx_upload_sessions_expires_at).
+func (r *PostgresRepository) ListExpiredSessions(ctx context.Context, limit int) ([]uploads.Session, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT `+uploadSessionColumns+`
+		FROM upload_sessions
+		WHERE status IN ('pending', 'uploading') AND expires_at < now()
+		ORDER BY expires_at
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []uploads.Session
+	for rows.Next() {
+		session, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
+// ExpireSession flips an open session to `expired`, guarded so it only succeeds
+// while the session is still pending/uploading. The bool reports whether this
+// call won the transition — a false return means completion or abort got there
+// first, and the caller must not abort the (possibly finalized) multipart upload.
+func (r *PostgresRepository) ExpireSession(ctx context.Context, id string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE upload_sessions
+		SET status = 'expired', updated_at = now()
+		WHERE id = $1 AND status IN ('pending', 'uploading')
+	`, id)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 func scanSession(row interface{ Scan(...any) error }) (uploads.Session, error) {
 	var s uploads.Session
 	err := row.Scan(

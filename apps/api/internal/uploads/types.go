@@ -133,6 +133,15 @@ type Repository interface {
 	GetSession(ctx context.Context, id string) (Session, error)
 	SetSessionStatus(ctx context.Context, id, status string) error
 	CompleteSession(ctx context.Context, params CompleteSessionParams) error
+	// ListExpiredSessions returns up to limit sessions whose deadline has passed
+	// and that are still pending/uploading (i.e. never finished or aborted), so
+	// the sweeper can release their multipart uploads.
+	ListExpiredSessions(ctx context.Context, limit int) ([]Session, error)
+	// ExpireSession atomically flips a still-open session to `expired`, returning
+	// true only if this call won the transition. A false return means another
+	// path (completion or abort) already moved the session, so the sweeper must
+	// not touch its multipart upload.
+	ExpireSession(ctx context.Context, id string) (bool, error)
 }
 
 // ObjectStorage is the multipart surface the service needs from MinIO. The

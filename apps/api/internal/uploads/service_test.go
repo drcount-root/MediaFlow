@@ -67,6 +67,33 @@ func (f *fakeRepo) SetSessionStatus(_ context.Context, id, status string) error 
 	return nil
 }
 
+func (f *fakeRepo) ListExpiredSessions(_ context.Context, limit int) ([]Session, error) {
+	var out []Session
+	now := time.Now().UTC()
+	for _, s := range f.sessions {
+		if (s.Status == StatusPending || s.Status == StatusUploading) && s.ExpiresAt.Before(now) {
+			out = append(out, s)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) ExpireSession(_ context.Context, id string) (bool, error) {
+	s, ok := f.sessions[id]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if s.Status != StatusPending && s.Status != StatusUploading {
+		return false, nil
+	}
+	s.Status = StatusExpired
+	f.sessions[id] = s
+	return true, nil
+}
+
 func (f *fakeRepo) CompleteSession(_ context.Context, p CompleteSessionParams) error {
 	s, ok := f.sessions[p.SessionID]
 	if !ok {

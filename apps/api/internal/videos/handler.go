@@ -15,8 +15,14 @@ func NewHandler(service *Service) *Handler {
 	return &Handler{service: service}
 }
 
-func (h *Handler) RegisterRoutes(router gin.IRouter) {
-	router.POST("/videos/upload", h.upload)
+// RegisterRoutes wires the video read endpoints. The legacy proxy upload
+// (POST /videos/upload, which streams bytes through the API) is registered only
+// when enableLegacyUpload is set — M6 replaced it with the presigned multipart
+// ingest in internal/uploads, and it is kept solely for comparison benchmarks.
+func (h *Handler) RegisterRoutes(router gin.IRouter, enableLegacyUpload bool) {
+	if enableLegacyUpload {
+		router.POST("/videos/upload", h.upload)
+	}
 	router.GET("/videos", h.list)
 	router.GET("/videos/:id", h.get)
 	router.GET("/videos/:id/playback", h.playback)

@@ -24,7 +24,7 @@ func TestUploadCreatesQueuedVideo(t *testing.T) {
 	service := NewService(repo, storage, "mediaflow-raw", 1024)
 
 	router := gin.New()
-	NewHandler(service).RegisterRoutes(router)
+	NewHandler(service).RegisterRoutes(router, true)
 
 	body, contentType := multipartBody(t, map[string]string{
 		"title":       "Demo",
@@ -73,7 +73,7 @@ func TestUploadReplaysIdempotencyKey(t *testing.T) {
 	service := NewService(repo, storage, "mediaflow-raw", 1<<20)
 
 	router := gin.New()
-	NewHandler(service).RegisterRoutes(router)
+	NewHandler(service).RegisterRoutes(router, true)
 
 	doUpload := func() *httptest.ResponseRecorder {
 		body, contentType := multipartBody(t, map[string]string{"title": "Demo"}, "file", "demo.mp4", "video/mp4", "video bytes")
@@ -116,7 +116,7 @@ func TestUploadRejectsMissingTitle(t *testing.T) {
 
 	service := NewService(&fakeRepository{}, &fakeStorage{}, "mediaflow-raw", 1024)
 	router := gin.New()
-	NewHandler(service).RegisterRoutes(router)
+	NewHandler(service).RegisterRoutes(router, true)
 
 	body, contentType := multipartBody(t, nil, "file", "demo.mp4", "video/mp4", "video bytes")
 	request := httptest.NewRequest(http.MethodPost, "/videos/upload", body)
@@ -135,7 +135,7 @@ func TestUploadRejectsUnsupportedFileType(t *testing.T) {
 
 	service := NewService(&fakeRepository{}, &fakeStorage{}, "mediaflow-raw", 1024)
 	router := gin.New()
-	NewHandler(service).RegisterRoutes(router)
+	NewHandler(service).RegisterRoutes(router, true)
 
 	body, contentType := multipartBody(t, map[string]string{"title": "Demo"}, "file", "demo.txt", "text/plain", "not video")
 	request := httptest.NewRequest(http.MethodPost, "/videos/upload", body)

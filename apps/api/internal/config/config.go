@@ -26,6 +26,7 @@ type Config struct {
 	UploadPartURLTTL     time.Duration
 	UploadSweepInterval  time.Duration
 	UploadSweepBatchSize int
+	EnableLegacyUpload   bool
 }
 
 func Load() Config {
@@ -49,6 +50,7 @@ func Load() Config {
 		UploadPartURLTTL:     getDurationEnv("UPLOAD_PART_URL_TTL", time.Hour),
 		UploadSweepInterval:  getDurationEnv("UPLOAD_SWEEP_INTERVAL", 5*time.Minute),
 		UploadSweepBatchSize: int(getInt64Env("UPLOAD_SWEEP_BATCH_SIZE", 100)),
+		EnableLegacyUpload:   getBoolEnv("ENABLE_LEGACY_UPLOAD", false),
 	}
 }
 

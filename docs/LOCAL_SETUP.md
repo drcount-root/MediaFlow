@@ -129,19 +129,33 @@ Open http://localhost:3000.
 3. When status is `ready`, open the watch page and play it. Use the quality menu
    to switch renditions (360p/480p/720p depending on the source resolution).
 
-Same flow via the API directly (no browser):
+Ingest (M6) is **presigned multipart**: the API is a control plane and the file
+bytes go from the browser straight to MinIO, never through the API process. The
+scripted flow is therefore multi-step:
 
 ```bash
-# Upload
-curl -F "title=Demo" -F "file=@/path/to/clip.mp4;type=video/mp4" \
-  http://localhost:8080/videos/upload
+# 1. Create a session (declare size + part size); returns id, partCount, etc.
+curl -X POST http://localhost:8080/uploads -H 'Content-Type: application/json' \
+  -d '{"title":"Demo","originalFilename":"clip.mp4","contentType":"video/mp4",
+       "totalSize":<BYTES>,"partSize":8388608}'
 
-# Poll status (use the id from the upload response)
+# 2. For each part n: get a presigned PUT URL, then PUT the byte range to MinIO
+#    directly (the URL host is :9000, not the API). Capture each ETag header.
+curl http://localhost:8080/uploads/<SESSION_ID>/parts/<n>/url
+
+# 3. Complete with the part list; creates the video + enqueues transcode.
+curl -X POST http://localhost:8080/uploads/<SESSION_ID>/complete \
+  -H 'Content-Type: application/json' \
+  -d '{"parts":[{"partNumber":1,"etag":"<ETAG>"}]}'
+
+# Poll status / get a 1-hour presigned playback URL once "ready"
 curl http://localhost:8080/videos/<VIDEO_ID>
-
-# Get a 1-hour presigned playback URL once status is "ready"
 curl http://localhost:8080/videos/<VIDEO_ID>/playback
 ```
+
+> The old single-shot proxy `POST /videos/upload` (streams bytes through the API)
+> is disabled by default since M6; set `ENABLE_LEGACY_UPLOAD=true` to re-enable it
+> for comparison benchmarks.
 
 You can inspect the produced objects in the MinIO console
 (http://localhost:9001): raw uploads under `mediaflow-raw`, HLS output under

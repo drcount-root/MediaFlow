@@ -70,3 +70,97 @@ export async function uploadVideo(formData: FormData): Promise<VideoItem> {
   });
 }
 
+// --- M6 presigned multipart ingest -----------------------------------------
+
+export type UploadSessionStatus =
+  | "pending"
+  | "uploading"
+  | "completed"
+  | "aborted"
+  | "expired";
+
+export type UploadedPart = {
+  partNumber: number;
+  etag: string;
+  size: number;
+};
+
+export type UploadSession = {
+  id: string;
+  title: string;
+  status: UploadSessionStatus;
+  partSize: number;
+  totalSize: number;
+  partCount: number;
+  contentType: string;
+  originalFilename: string;
+  videoId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  uploadedParts?: UploadedPart[];
+};
+
+export type CreateUploadSessionInput = {
+  title: string;
+  description?: string;
+  originalFilename: string;
+  contentType: string;
+  totalSize: number;
+  partSize: number;
+};
+
+export type PartUrlResponse = {
+  partNumber: number;
+  url: string;
+  method: string;
+  expiresAt: string;
+};
+
+export type CompleteUploadResponse = {
+  videoId: string;
+  status: string;
+};
+
+export async function createUploadSession(
+  input: CreateUploadSessionInput
+): Promise<UploadSession> {
+  return request<UploadSession>("/uploads", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+}
+
+export async function getUploadSession(id: string): Promise<UploadSession> {
+  return request<UploadSession>(`/uploads/${id}`);
+}
+
+export async function getPartUrl(
+  id: string,
+  partNumber: number
+): Promise<PartUrlResponse> {
+  return request<PartUrlResponse>(`/uploads/${id}/parts/${partNumber}/url`);
+}
+
+export async function completeUpload(
+  id: string,
+  parts: { partNumber: number; etag: string }[]
+): Promise<CompleteUploadResponse> {
+  return request<CompleteUploadResponse>(`/uploads/${id}/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parts })
+  });
+}
+
+export async function abortUpload(id: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/uploads/${id}`, {
+    method: "DELETE",
+    cache: "no-store"
+  });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`Failed to abort upload (status ${response.status})`);
+  }
+}
+

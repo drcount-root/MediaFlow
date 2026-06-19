@@ -32,7 +32,7 @@ func NewRouterWithServices(cfg config.Config, videoService *videos.Service, uplo
 	})
 
 	if videoService != nil {
-		videos.NewHandler(videoService).RegisterRoutes(router)
+		videos.NewHandler(videoService).RegisterRoutes(router, cfg.EnableLegacyUpload)
 	}
 	if uploadService != nil {
 		uploads.NewHandler(uploadService).RegisterRoutes(router)

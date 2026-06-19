@@ -246,6 +246,33 @@ textarea {
   color: var(--danger);
 }
 
+.progress {
+  background: var(--line);
+  border-radius: 999px;
+  height: 10px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.progress-bar {
+  background: var(--accent);
+  height: 100%;
+  transition: width 0.2s ease;
+}
+
+.progress-meta {
+  color: var(--muted);
+  display: flex;
+  font-size: 13px;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+
+.button-row {
+  display: flex;
+  gap: 10px;
+}
+
 .watch-layout {
   display: grid;
   gap: 20px;

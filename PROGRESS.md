@@ -1,27 +1,26 @@
 # MediaFlow Progress Tracker
 
-Last updated: 2026-06-18
+Last updated: 2026-06-19
 
 ## Overall Status
 
-Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestones 4 and 5 done. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
+Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestones 4, 5, and 6 done. Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
 
 Current focus:
 
 ```txt
 Milestone 5: Correctness Under Failure — COMPLETE (ADRs 0002–0006)
-Milestone 6: Scalable Ingest — in progress
+Milestone 6: Scalable Ingest — COMPLETE (ADRs 0007–0010)
   slice A (sessions + presigned parts) done (ADR 0007).
-  slice B (completion + validation + enqueue) done (ADR 0008): POST
-    /uploads/:id/complete validates ETags/size against object storage, finalizes
-    multipart, and creates video+job+outbox in one tx; idempotent replay.
-    Live drill: 7MiB MP4 uploaded as 2 parts straight to MinIO (never the API),
-    completed, worker drove it to ready.
-  slice C (expiry sweep) done (ADR 0009): a background sweeper expires abandoned
-    pending/uploading sessions past expires_at and aborts their orphaned MinIO
-    multipart uploads; claim-first guarded UPDATE keeps it race-safe against a
-    concurrent completion. No schema change (expired enum + index already shipped).
-  next: slice D (web uploader + retire legacy proxy).
+  slice B (completion + validation + enqueue) done (ADR 0008).
+  slice C (expiry sweep) done (ADR 0009).
+  slice D (web uploader + retire legacy proxy) done (ADR 0010): browser slices
+    the file and PUTs parts directly to MinIO (4-lane bounded concurrency,
+    per-part presigned URL, backoff retry, cancel via AbortController); byte-level
+    progress bar; resume-after-reload via a localStorage file-identity record.
+    Legacy POST /videos/upload gated behind ENABLE_LEGACY_UPLOAD (default off).
+  next: Milestone 7 (distributed transcoding — planner fan-out of per-rendition
+    jobs, atomic aggregation, finalize step).
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -36,7 +35,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 3. Web Playback Path | Done | Next.js app supports upload, video list, status polling, HLS watch page, manual quality selection, and local smoke checks. |
 | 4. CI and Integration Test Harness | Done | GitHub Actions + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow). CI green on PR #1 and required via a ruleset on a public, protected `main`. ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
 | 5. Correctness Under Failure | Done | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `0004`). Slice D (idempotency+shutdown) done: `Idempotency-Key` on upload (partial unique index, replay returns original with 200, race recovers via 23505), graceful SIGTERM (drain in-flight job within `WORKER_SHUTDOWN_GRACE`, reaper covers overruns), retry hygiene verified (skip-if-ready, variant clear, deterministic keys) (ADR `docs/adr/0005-idempotency-and-graceful-shutdown.md`). RabbitMQ-down drill done: upload stays 201 with the broker down (request path is broker-independent); the drill exposed a relay that held one connection for life and never recovered, fixed with a lazy-reconnecting publisher so the outbox drains automatically on broker return — no API restart (ADR `docs/adr/0006-relay-broker-reconnect.md`). |
-| 6. Scalable Ingest | In progress | Slice A (sessions + presigned parts) done: `upload_sessions` table (migration `000005`, status enum `pending\|uploading\|completed\|aborted\|expired`), control-plane endpoints (`POST /uploads`, `GET /uploads/:id`, `GET /uploads/:id/parts/:n/url`, `DELETE /uploads/:id`), MinIO multipart via `minio.Core`, size/part validation at creation, resume by listing parts from object storage (ADR `0007`). Slice B (completion+validation+enqueue) done: `POST /uploads/:id/complete` validates declared ETags + assembled size against what object storage holds (tampered/short/oversize → clean `422`), finalizes multipart with stored ETags, then creates video+job+events+outbox in one tx (reuses M5) and links the session; completion is idempotent (replay returns the same video, concurrent completions race-safe via a guarded UPDATE). Live drill: a 7MiB MP4 uploaded as two presigned parts straight to MinIO (PUTs hit `:9000`, never the API on `:8080`), completed, and the worker drove it to `ready` with 2 variants; outbox drained 1/1 (ADR `docs/adr/0008-upload-completion-validation.md`). Slice C (expiry sweep) done: a background sweeper (mirrors the outbox relay; `UPLOAD_SWEEP_INTERVAL` default 5m) expires `pending`/`uploading` sessions past `expires_at` via a guarded claim-first `UPDATE` (race-safe against a concurrent completion) and aborts their orphaned MinIO multipart uploads; abort failures are logged and leave the row `expired` (MinIO lifecycle is the backstop). No schema change — the `expired` enum + `expires_at` index shipped in `000005`. Integration `TestUploadSweepExpiresAbandonedSession` proves against real MinIO that the staged part is gone after the sweep (ADR `docs/adr/0009-upload-session-expiry-sweep.md`). Remaining: web uploader, retire legacy proxy. |
+| 6. Scalable Ingest | Done | Slice A (sessions + presigned parts) done: `upload_sessions` table (migration `000005`, status enum `pending\|uploading\|completed\|aborted\|expired`), control-plane endpoints (`POST /uploads`, `GET /uploads/:id`, `GET /uploads/:id/parts/:n/url`, `DELETE /uploads/:id`), MinIO multipart via `minio.Core`, size/part validation at creation, resume by listing parts from object storage (ADR `0007`). Slice B (completion+validation+enqueue) done: `POST /uploads/:id/complete` validates declared ETags + assembled size against what object storage holds (tampered/short/oversize → clean `422`), finalizes multipart with stored ETags, then creates video+job+events+outbox in one tx (reuses M5) and links the session; completion is idempotent (replay returns the same video, concurrent completions race-safe via a guarded UPDATE). Live drill: a 7MiB MP4 uploaded as two presigned parts straight to MinIO (PUTs hit `:9000`, never the API on `:8080`), completed, and the worker drove it to `ready` with 2 variants; outbox drained 1/1 (ADR `docs/adr/0008-upload-completion-validation.md`). Slice C (expiry sweep) done: a background sweeper (mirrors the outbox relay; `UPLOAD_SWEEP_INTERVAL` default 5m) expires `pending`/`uploading` sessions past `expires_at` via a guarded claim-first `UPDATE` (race-safe against a concurrent completion) and aborts their orphaned MinIO multipart uploads; abort failures are logged and leave the row `expired` (MinIO lifecycle is the backstop). No schema change — the `expired` enum + `expires_at` index shipped in `000005`. Integration `TestUploadSweepExpiresAbandonedSession` proves against real MinIO that the staged part is gone after the sweep (ADR `docs/adr/0009-upload-session-expiry-sweep.md`). Slice D (web uploader + retire legacy proxy) done: browser chunked uploader (`lib/uploads.ts`) slices the file and PUTs parts directly to MinIO with 4-lane bounded concurrency, per-part presigned URLs, 4-attempt backoff retry, and a shared `AbortController` for cancel; real byte-level progress via XHR upload events; resume-after-reload keyed on a `localStorage` file-identity record (re-select the same file → only the missing parts upload). Legacy `POST /videos/upload` is now gated behind `ENABLE_LEGACY_UPLOAD` (default off; handler kept for M10 proxy-vs-direct benchmarks) (ADR `docs/adr/0010-web-chunked-uploader.md`). |
 | 7. Distributed Transcoding | Not started | Planner fan-out of per-rendition jobs, atomic aggregation, finalize step, parallel workers. |
 | 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
 | 9. Observability | Not started | OpenTelemetry traces across the queue, Prometheus metrics, Jaeger + Grafana dashboards. |
@@ -173,12 +172,13 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 - [x] `DELETE /uploads/:id`: abort multipart upload
 - [x] Cleanup loop: abort expired sessions and orphaned multipart uploads (sweeper in `internal/uploads`, wired in `cmd/api`; `UPLOAD_SWEEP_INTERVAL`/`UPLOAD_SWEEP_BATCH_SIZE`; ADR `0009`)
 - [x] Enforce size limits at session creation and at completion
-- [ ] Web: chunked uploader with bounded parallelism and per-part retry
-- [ ] Web: resume upload after page reload (persist session id)
-- [ ] Web: real upload progress UI
-- [ ] Remove (or flag-gate) legacy `POST /videos/upload` proxy endpoint
+- [x] Web: chunked uploader with bounded parallelism and per-part retry (`lib/uploads.ts`: 4 lanes draining a shared queue, presigned PUT per part via XHR for progress, 4-attempt backoff+jitter retry, shared `AbortController` cancel; ADR `0010`)
+- [x] Web: resume upload after page reload (persist session id) (identity record in `localStorage`; re-select the same file → `GET /uploads/:id` returns stored parts, only missing parts upload)
+- [x] Web: real upload progress UI (byte-level progress bar + parts counter, Cancel/Discard)
+- [x] Remove (or flag-gate) legacy `POST /videos/upload` proxy endpoint (gated behind `ENABLE_LEGACY_UPLOAD`, default off; route unregistered by default, handler kept for M10 benchmarks)
 - [x] Tests: session lifecycle, resume, checksum mismatch, oversize rejection
 - [x] Verify: 500MB upload never transits the API process (live drill 2026-06-17: 7MiB MP4 uploaded as two presigned parts directly to MinIO — PUTs hit `:9000`, not the API on `:8080` — completed via the API, worker drove it to `ready`; the path is size-independent so it holds for 500MB)
+- [x] Verify: browser CORS contract for direct-to-MinIO PUT (live drill 2026-06-19: OPTIONS preflight from `Origin: http://localhost:3000` returns `Access-Control-Allow-Methods: PUT`; the actual PUT exposes `Etag` via `Access-Control-Expose-Headers` so `xhr.getResponseHeader("ETag")` works; `GET /uploads/:id` then surfaced the staged part and completion enqueued the video `201`). Full UI click-through (tab-kill + reload resume) still to be exercised in a browser.
 
 ### Milestone 7: Distributed Transcoding
 

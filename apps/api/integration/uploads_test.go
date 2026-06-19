@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"testing"
 	"time"
@@ -240,6 +241,82 @@ func TestUploadSessionCompleteRejectsTamperedPart(t *testing.T) {
 	}
 	if sessStatus == "completed" {
 		t.Fatal("session must not be completed after a tampered-part failure")
+	}
+}
+
+// TestUploadSweepExpiresAbandonedSession proves the M6 cleanup loop against real
+// MinIO + Postgres: an abandoned session past its deadline is flipped to
+// `expired` and its multipart upload (with a staged part) is released, so the
+// orphaned parts no longer linger in object storage.
+func TestUploadSweepExpiresAbandonedSession(t *testing.T) {
+	db := openDB(t)
+	truncateAll(t, db)
+	st, err := storage.NewMinIOStorage(infra.minioEndpoint, infra.minioAccessKey, infra.minioSecretKey, false, rawBucket, processedBucket, thumbnailBucket)
+	if err != nil {
+		t.Fatalf("new minio storage: %v", err)
+	}
+	repo := database.NewPostgresRepository(db)
+	svc := uploads.NewService(repo, st, rawBucket, 500*1024*1024, time.Hour, time.Hour)
+	ctx := context.Background()
+
+	session, err := svc.Create(ctx, uploads.CreateParams{
+		Title:            "Abandoned",
+		OriginalFilename: "clip.mp4",
+		ContentType:      "video/mp4",
+		TotalSize:        int64(partSize + 1024),
+		PartSize:         partSize,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Stage one part directly to object storage, then walk away.
+	url, _, err := svc.PartURL(ctx, session.ID, 1)
+	if err != nil {
+		t.Fatalf("part url: %v", err)
+	}
+	putPart(t, url, bytes.Repeat([]byte("a"), partSize))
+
+	// The part is really in object storage before the sweep.
+	if parts, err := st.ListParts(ctx, session.ObjectKey, session.UploadID); err != nil {
+		t.Fatalf("list parts before sweep: %v", err)
+	} else if len(parts) != 1 {
+		t.Fatalf("expected 1 staged part before sweep, got %d", len(parts))
+	}
+
+	// Force the deadline into the past so the sweeper considers it expired.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE upload_sessions SET expires_at = now() - interval '1 hour' WHERE id = $1`, session.ID); err != nil {
+		t.Fatalf("backdate expiry: %v", err)
+	}
+
+	sweeper := uploads.NewSweeper(repo, st, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Minute, 100)
+	n, err := sweeper.SweepOnce(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 session swept, got %d", n)
+	}
+
+	// Session is marked expired.
+	var status string
+	if err := db.QueryRowContext(ctx,
+		`SELECT status FROM upload_sessions WHERE id = $1`, session.ID).Scan(&status); err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	if status != uploads.StatusExpired {
+		t.Fatalf("expected expired, got %q", status)
+	}
+
+	// The multipart upload is gone: listing its parts now fails (no such upload).
+	if _, err := st.ListParts(ctx, session.ObjectKey, session.UploadID); err == nil {
+		t.Fatal("expected the multipart upload to be aborted, but its parts still list")
+	}
+
+	// A second pass is a no-op (the session is no longer open).
+	if n, err := sweeper.SweepOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("second sweep should be a no-op, got n=%d err=%v", n, err)
 	}
 }
 

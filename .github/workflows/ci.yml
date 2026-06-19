@@ -49,9 +49,14 @@ jobs:
           go-version-file: apps/worker/go.mod
           cache-dependency-path: apps/worker/go.sum
       - name: Install ffmpeg
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          for attempt in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y ffmpeg && break
+            echo "apt attempt $attempt failed; retrying..." >&2
+            sleep 5
+          done
+          ffmpeg -version
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -113,8 +118,13 @@ jobs:
           go-version-file: apps/worker/go.mod
           cache-dependency-path: apps/worker/go.sum
       - name: Install ffmpeg
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          for attempt in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y ffmpeg && break
+            echo "apt attempt $attempt failed; retrying..." >&2
+            sleep 5
+          done
+          ffmpeg -version
       - name: Integration tests
         run: go test -tags integration ./...

@@ -69,6 +69,16 @@ func main() {
 		close(relayDone)
 	}()
 
+	// The sweeper expires abandoned upload sessions and aborts their orphaned
+	// multipart uploads so staged parts don't accumulate in object storage.
+	sweeper := uploads.NewSweeper(repo, objectStorage, logger, cfg.UploadSweepInterval, cfg.UploadSweepBatchSize)
+	sweepCtx, sweepCancel := context.WithCancel(context.Background())
+	sweepDone := make(chan struct{})
+	go func() {
+		sweeper.Run(sweepCtx)
+		close(sweepDone)
+	}()
+
 	router := httpapi.NewRouterWithServices(cfg, videoService, uploadService)
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -98,6 +108,9 @@ func main() {
 
 	relayCancel()
 	<-relayDone
+
+	sweepCancel()
+	<-sweepDone
 
 	logger.Info("api server stopped")
 }

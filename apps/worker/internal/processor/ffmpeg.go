@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -76,80 +77,85 @@ func (p FFmpegProcessor) GenerateThumbnail(ctx context.Context, inputPath, outpu
 	return nil
 }
 
-func (p FFmpegProcessor) GenerateHLS(ctx context.Context, inputPath, outputDir string, probe job.ProbeResult) ([]job.Variant, error) {
+// GenerateRendition transcodes the source into exactly one quality (M7). It
+// writes index.m3u8 + segment_*.ts into outputDir and returns the variant with
+// its local dir populated; the caller uploads the dir and records the variant.
+func (p FFmpegProcessor) GenerateRendition(ctx context.Context, inputPath, outputDir string, spec job.RenditionSpec, hasAudio bool) (job.Variant, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return nil, err
+		return job.Variant{}, err
 	}
 
-	variants := selectVariants(probe.Height)
-	if len(variants) == 0 {
-		return nil, fmt.Errorf("no variants selected for source height %d", probe.Height)
+	playlist := filepath.Join(outputDir, "index.m3u8")
+	args := []string{
+		"-y",
+		"-i", inputPath,
+		"-vf", fmt.Sprintf("scale=-2:%d", spec.Height),
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-b:v", fmt.Sprintf("%dk", spec.Bitrate/1000),
+		"-maxrate", fmt.Sprintf("%dk", int(float64(spec.Bitrate)*1.07)/1000),
+		"-bufsize", fmt.Sprintf("%dk", int(float64(spec.Bitrate)*1.5)/1000),
+		"-g", "48",
+		"-keyint_min", "48",
+		"-sc_threshold", "0",
 	}
+
+	if hasAudio {
+		args = append(args, "-c:a", "aac", "-ar", "48000", "-b:a", "128k")
+	} else {
+		args = append(args, "-an")
+	}
+
+	args = append(args,
+		"-hls_time", "4",
+		"-hls_playlist_type", "vod",
+		"-hls_segment_filename", filepath.Join(outputDir, "segment_%03d.ts"),
+		playlist,
+	)
+
+	cmd := exec.CommandContext(ctx, p.FFmpegPath, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return job.Variant{}, fmt.Errorf("hls ffmpeg failed for %s: %w: %s", spec.Quality, err, string(output))
+	}
+
+	return job.Variant{
+		Quality:     spec.Quality,
+		Width:       spec.Width,
+		Height:      spec.Height,
+		Bitrate:     spec.Bitrate,
+		Codec:       spec.Codec,
+		PlaylistKey: "index.m3u8",
+		LocalDir:    outputDir,
+	}, nil
+}
+
+// BuildMasterPlaylist renders a master.m3u8 referencing each variant's
+// {quality}/index.m3u8. Variants are written in descending bitrate so players
+// pick a sensible default. The finalize stage uploads the result (M7).
+func BuildMasterPlaylist(variants []job.Variant) []byte {
+	ordered := append([]job.Variant(nil), variants...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Bitrate > ordered[j].Bitrate })
 
 	master := &bytes.Buffer{}
 	master.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
-
-	for idx := range variants {
-		variant := variants[idx]
-		localDir := filepath.Join(outputDir, variant.Quality)
-		if err := os.MkdirAll(localDir, 0o755); err != nil {
-			return nil, err
-		}
-
-		playlist := filepath.Join(localDir, "index.m3u8")
-		args := []string{
-			"-y",
-			"-i", inputPath,
-			"-vf", fmt.Sprintf("scale=-2:%d", variant.Height),
-			"-c:v", "libx264",
-			"-preset", "veryfast",
-			"-b:v", fmt.Sprintf("%dk", variant.Bitrate/1000),
-			"-maxrate", fmt.Sprintf("%dk", int(float64(variant.Bitrate)*1.07)/1000),
-			"-bufsize", fmt.Sprintf("%dk", int(float64(variant.Bitrate)*1.5)/1000),
-			"-g", "48",
-			"-keyint_min", "48",
-			"-sc_threshold", "0",
-		}
-
-		if probe.HasAudio {
-			args = append(args, "-c:a", "aac", "-ar", "48000", "-b:a", "128k")
-		} else {
-			args = append(args, "-an")
-		}
-
-		args = append(args,
-			"-hls_time", "4",
-			"-hls_playlist_type", "vod",
-			"-hls_segment_filename", filepath.Join(localDir, "segment_%03d.ts"),
-			playlist,
-		)
-
-		cmd := exec.CommandContext(ctx, p.FFmpegPath, args...)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return nil, fmt.Errorf("hls ffmpeg failed for %s: %w: %s", variant.Quality, err, string(output))
-		}
-
-		variants[idx].LocalDir = localDir
-		variants[idx].PlaylistKey = "index.m3u8"
-		master.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d\n%s/index.m3u8\n", variant.Bitrate, variant.Width, variant.Height, variant.Quality))
+	for _, v := range ordered {
+		master.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d\n%s/index.m3u8\n", v.Bitrate, v.Width, v.Height, v.Quality))
 	}
-
-	if err := os.WriteFile(filepath.Join(outputDir, "master.m3u8"), master.Bytes(), 0o644); err != nil {
-		return nil, err
-	}
-
-	return variants, nil
+	return master.Bytes()
 }
 
-func selectVariants(sourceHeight int) []job.Variant {
-	candidates := []job.Variant{
+// PlanRenditions picks the target qualities for a source of the given height.
+// It is the map step of the fan-out: the planner turns this list into one
+// rendition job per spec. A tiny source still gets the smallest rendition.
+func PlanRenditions(sourceHeight int) []job.RenditionSpec {
+	candidates := []job.RenditionSpec{
 		{Quality: "720p", Width: 1280, Height: 720, Bitrate: 2800000, Codec: "h264"},
 		{Quality: "480p", Width: 854, Height: 480, Bitrate: 1400000, Codec: "h264"},
 		{Quality: "360p", Width: 640, Height: 360, Bitrate: 800000, Codec: "h264"},
 	}
 
-	var selected []job.Variant
+	var selected []job.RenditionSpec
 	for _, candidate := range candidates {
 		if sourceHeight >= candidate.Height {
 			selected = append(selected, candidate)

@@ -15,7 +15,9 @@ const (
 	StatusReady      = "ready"
 	StatusFailed     = "failed"
 
-	JobTypeTranscode = "transcode"
+	// JobTypePlan is the type of the job ingest enqueues. The worker's planner
+	// claims it on the transcode queue, then fans out per-rendition jobs (M7).
+	JobTypePlan = "plan"
 
 	// Queue contract for the transcode job. Defined here (the lowest layer) so
 	// both the queue publisher and the outbox writer can reference it without an

@@ -96,7 +96,7 @@ func (r *PostgresRepository) CompleteSession(ctx context.Context, params uploads
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO video_jobs (id, video_id, job_type, status)
 		VALUES ($1, $2, $3, 'queued')
-	`, params.JobID, params.VideoID, videos.JobTypeTranscode)
+	`, params.JobID, params.VideoID, videos.JobTypePlan)
 	if err != nil {
 		return err
 	}

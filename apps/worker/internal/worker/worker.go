@@ -22,8 +22,16 @@ import (
 
 const (
 	transcodeQueue = "video.transcode"
+	renditionQueue = "video.rendition"
+	finalizeQueue  = "video.finalize"
 	retryQueue     = "video.transcode.retry"
 	dlqQueue       = "video.transcode.dlq"
+)
+
+const (
+	tagPlan      = "mediaflow-worker-plan"
+	tagRendition = "mediaflow-worker-rendition"
+	tagFinalize  = "mediaflow-worker-finalize"
 )
 
 type Worker struct {
@@ -49,25 +57,7 @@ func New(cfg config.Config, logger *slog.Logger, db *sql.DB, objectStorage *stor
 		return nil, err
 	}
 
-	if err := channel.ExchangeDeclare("mediaflow.video", amqp.ExchangeDirect, true, false, false, false, nil); err != nil {
-		channel.Close()
-		conn.Close()
-		return nil, err
-	}
-	if _, err := channel.QueueDeclare(transcodeQueue, true, false, false, false, nil); err != nil {
-		channel.Close()
-		conn.Close()
-		return nil, err
-	}
-	if err := channel.QueueBind(transcodeQueue, transcodeQueue, "mediaflow.video", false, nil); err != nil {
-		channel.Close()
-		conn.Close()
-		return nil, err
-	}
-
-	// Retry queue: no consumer. A message published here waits out its per-message
-	// TTL, then the broker dead-letters it back to the main transcode queue.
-	if err := declareRetryAndDLQ(channel); err != nil {
+	if err := declareTopology(channel); err != nil {
 		channel.Close()
 		conn.Close()
 		return nil, err
@@ -110,10 +100,30 @@ func New(cfg config.Config, logger *slog.Logger, db *sql.DB, objectStorage *stor
 	}, nil
 }
 
-// declareRetryAndDLQ declares the retry queue (which dead-letters back to the
-// main transcode queue once a message's TTL expires) and the terminal DLQ, plus
-// their bindings on the shared mediaflow.video exchange.
-func declareRetryAndDLQ(channel *amqp.Channel) error {
+// declareTopology declares the fan-out queues (plan/rendition/finalize), the
+// transcode retry queue (which dead-letters back to the main transcode queue
+// once a message's TTL expires), the terminal DLQ, and their bindings on the
+// shared mediaflow.video exchange.
+func declareTopology(channel *amqp.Channel) error {
+	if err := channel.ExchangeDeclare("mediaflow.video", amqp.ExchangeDirect, true, false, false, false, nil); err != nil {
+		return err
+	}
+
+	for _, q := range []struct{ name, key string }{
+		{transcodeQueue, transcodeQueue},
+		{renditionQueue, job.RenditionRoutingKey},
+		{finalizeQueue, job.FinalizeRoutingKey},
+	} {
+		if _, err := channel.QueueDeclare(q.name, true, false, false, false, nil); err != nil {
+			return err
+		}
+		if err := channel.QueueBind(q.name, q.key, "mediaflow.video", false, nil); err != nil {
+			return err
+		}
+	}
+
+	// Retry queue: no consumer. A message published here waits out its per-message
+	// TTL, then the broker dead-letters it back to the main transcode queue.
 	if _, err := channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
 		"x-dead-letter-exchange":    "mediaflow.video",
 		"x-dead-letter-routing-key": transcodeQueue,
@@ -129,10 +139,16 @@ func declareRetryAndDLQ(channel *amqp.Channel) error {
 	return channel.QueueBind(dlqQueue, job.DLQRoutingKey, "mediaflow.video", false, nil)
 }
 
-const consumerTag = "mediaflow-worker"
-
 func (w *Worker) Run(ctx context.Context) error {
-	deliveries, err := w.channel.Consume(transcodeQueue, consumerTag, false, false, false, false, nil)
+	planCh, err := w.channel.Consume(transcodeQueue, tagPlan, false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+	renditionCh, err := w.channel.Consume(renditionQueue, tagRendition, false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+	finalizeCh, err := w.channel.Consume(finalizeQueue, tagFinalize, false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -146,21 +162,38 @@ func (w *Worker) Run(ctx context.Context) error {
 	stopped := make(chan struct{})
 	go w.watchShutdown(ctx, cancelJobs, stopped)
 
-	w.logger.Info("worker consuming", "queue", transcodeQueue)
+	w.logger.Info("worker consuming", "queues", strings.Join([]string{transcodeQueue, renditionQueue, finalizeQueue}, ","))
 	shutdownCh := ctx.Done()
 	for {
 		select {
 		case <-shutdownCh:
 			// Observe the shutdown signal once. The watcher cancels the AMQP
-			// consumer, which closes `deliveries` after any prefetched message is
-			// handled; stop selecting on this channel so we don't busy-loop.
+			// consumers, which close the delivery channels after any prefetched
+			// message is handled; stop selecting here so we don't busy-loop.
 			shutdownCh = nil
-		case delivery, ok := <-deliveries:
+		case delivery, ok := <-planCh:
 			if !ok {
-				close(stopped)
-				return nil
+				planCh = nil
+				break
 			}
-			w.handleDelivery(jobCtx, delivery)
+			w.handleDelivery(jobCtx, delivery, w.handlePlan)
+		case delivery, ok := <-renditionCh:
+			if !ok {
+				renditionCh = nil
+				break
+			}
+			w.handleDelivery(jobCtx, delivery, w.handleRendition)
+		case delivery, ok := <-finalizeCh:
+			if !ok {
+				finalizeCh = nil
+				break
+			}
+			w.handleDelivery(jobCtx, delivery, w.handleFinalize)
+		}
+
+		if planCh == nil && renditionCh == nil && finalizeCh == nil {
+			close(stopped)
+			return nil
 		}
 	}
 }
@@ -175,8 +208,10 @@ func (w *Worker) watchShutdown(ctx context.Context, abortJob context.CancelFunc,
 	}
 
 	w.logger.Info("shutdown signalled; draining in-flight job", "grace", w.cfg.ShutdownGrace.String())
-	if err := w.channel.Cancel(consumerTag, false); err != nil {
-		w.logger.Warn("consumer cancel failed", "error", err)
+	for _, tag := range []string{tagPlan, tagRendition, tagFinalize} {
+		if err := w.channel.Cancel(tag, false); err != nil {
+			w.logger.Warn("consumer cancel failed", "tag", tag, "error", err)
+		}
 	}
 
 	select {
@@ -200,34 +235,81 @@ func (w *Worker) Close() error {
 	return nil
 }
 
-func (w *Worker) handleDelivery(ctx context.Context, delivery amqp.Delivery) {
-	var payload job.TranscodeJob
-	if err := json.Unmarshal(delivery.Body, &payload); err != nil {
-		// A message we cannot even parse is poison: park it in the DLQ so it never
-		// loops, and ack the original so the consumer keeps moving.
-		w.logger.Error("invalid job payload, dead-lettering", "error", err)
-		if pubErr := w.publishDLQ(ctx, delivery.Body, "invalid job payload: "+err.Error()); pubErr != nil {
-			w.logger.Error("dead-letter publish failed", "error", pubErr)
-			_ = delivery.Nack(false, true) // keep it; try again rather than drop
-			return
-		}
-		_ = delivery.Ack(false)
-		return
+// handleDelivery parses a message and runs the stage handler. A body we cannot
+// even parse is poison: it is parked in the DLQ so it never loops.
+func (w *Worker) handleDelivery(ctx context.Context, delivery amqp.Delivery, handler func(context.Context, amqp.Delivery) error) {
+	if err := handler(ctx, delivery); err != nil {
+		w.logger.Error("delivery handling failed", "error", err)
 	}
-
-	procErr := w.Process(ctx, payload)
-	if procErr == nil {
-		_ = delivery.Ack(false)
-		return
-	}
-
-	w.handleFailure(ctx, delivery, payload, procErr)
 }
 
-// handleFailure decides what to do with a job that failed: schedule a backed-off
-// retry (transient, below max attempts) or dead-letter it and mark it failed
-// (permanent error, or attempts exhausted). Use a background context for the DB
-// and broker writes so a cancelled ctx (shutdown) still records the outcome.
+// handlePlan runs the plan stage and applies the M5 retry/DLQ policy on failure
+// (the plan job has a retry queue; renditions and finalize recover via the
+// reaper — see handleChildFailure).
+func (w *Worker) handlePlan(ctx context.Context, delivery amqp.Delivery) error {
+	var payload job.TranscodeJob
+	if err := json.Unmarshal(delivery.Body, &payload); err != nil {
+		return w.deadLetterPoison(ctx, delivery, err)
+	}
+
+	if procErr := w.ProcessPlan(ctx, payload); procErr != nil {
+		w.handleFailure(ctx, delivery, payload, procErr)
+		return nil
+	}
+	return delivery.Ack(false)
+}
+
+func (w *Worker) handleRendition(ctx context.Context, delivery amqp.Delivery) error {
+	var payload job.RenditionJob
+	if err := json.Unmarshal(delivery.Body, &payload); err != nil {
+		return w.deadLetterPoison(ctx, delivery, err)
+	}
+
+	if procErr := w.ProcessRendition(ctx, payload); procErr != nil {
+		return w.handleChildFailure(delivery, payload.JobID, payload.VideoID, "rendition", procErr)
+	}
+	return delivery.Ack(false)
+}
+
+func (w *Worker) handleFinalize(ctx context.Context, delivery amqp.Delivery) error {
+	var payload job.FinalizeJob
+	if err := json.Unmarshal(delivery.Body, &payload); err != nil {
+		return w.deadLetterPoison(ctx, delivery, err)
+	}
+
+	if procErr := w.ProcessFinalize(ctx, payload); procErr != nil {
+		return w.handleChildFailure(delivery, payload.JobID, payload.VideoID, "finalize", procErr)
+	}
+	return delivery.Ack(false)
+}
+
+// deadLetterPoison parks an unparseable message in the DLQ and acks the original
+// so the consumer keeps moving.
+func (w *Worker) deadLetterPoison(ctx context.Context, delivery amqp.Delivery, cause error) error {
+	w.logger.Error("invalid job payload, dead-lettering", "error", cause)
+	if pubErr := w.publishDLQ(ctx, delivery.Body, "invalid job payload: "+cause.Error()); pubErr != nil {
+		w.logger.Error("dead-letter publish failed", "error", pubErr)
+		return delivery.Nack(false, true) // keep it; try again rather than drop
+	}
+	return delivery.Ack(false)
+}
+
+// handleChildFailure handles a rendition or finalize error. Unlike the plan
+// stage, child stages do not have their own retry queue (M7 slice A): the job
+// row is left `processing` with its lease, and the reaper requeues it (below max
+// attempts) or fails the video (at max). Dropping the delivery (Nack, no
+// requeue) avoids a hot loop; the reaper drives recovery on the lease timeout.
+func (w *Worker) handleChildFailure(delivery amqp.Delivery, jobID, videoID, stage string, procErr error) error {
+	w.logger.Error("child stage failed; leaving for reaper",
+		"stage", stage, "jobId", jobID, "videoId", videoID, "error", procErr)
+	return delivery.Nack(false, false)
+}
+
+// handleFailure decides what to do with a plan job that failed: schedule a
+// backed-off retry (transient, below max attempts) or dead-letter it and mark it
+// failed (permanent error, or attempts exhausted). Use a background context for
+// the DB and broker writes so a cancelled ctx (shutdown) still records the
+// outcome.
 func (w *Worker) handleFailure(ctx context.Context, delivery amqp.Delivery, payload job.TranscodeJob, procErr error) {
 	bg := context.Background()
 	attempts, err := w.repo.JobAttempts(bg, payload.JobID)
@@ -329,18 +411,19 @@ func (w *Worker) confirmedPublish(ctx context.Context, routingKey string, msg am
 	return nil
 }
 
-func (w *Worker) Process(ctx context.Context, payload job.TranscodeJob) error {
+// ProcessPlan claims the plan job, probes the source, makes the thumbnail, and
+// fans out one rendition job per target quality (via the outbox). It does not
+// transcode — that is the rendition stage's job.
+func (w *Worker) ProcessPlan(ctx context.Context, payload job.TranscodeJob) error {
 	claimed, err := w.repo.ClaimJob(ctx, payload.JobID, payload.VideoID, w.cfg.WorkerID, w.cfg.JobLeaseDuration)
 	if err != nil {
 		return err
 	}
 	if !claimed {
-		w.logger.Info("job skipped", "jobId", payload.JobID, "videoId", payload.VideoID)
+		w.logger.Info("plan job skipped", "jobId", payload.JobID, "videoId", payload.VideoID)
 		return nil
 	}
 
-	// Keep the lease alive while FFmpeg runs so the reaper does not reclaim a job
-	// that is making progress. The heartbeat stops when processing returns.
 	hbCtx, stopHeartbeat := context.WithCancel(ctx)
 	defer stopHeartbeat()
 	go w.heartbeat(hbCtx, payload.JobID)
@@ -348,14 +431,13 @@ func (w *Worker) Process(ctx context.Context, payload job.TranscodeJob) error {
 	workDir := filepath.Join(w.cfg.WorkDir, payload.JobID)
 	inputPath := filepath.Join(workDir, "input.mp4")
 	thumbnailPath := filepath.Join(workDir, "thumbnail.jpg")
-	hlsDir := filepath.Join(workDir, "hls")
 	defer os.RemoveAll(workDir)
 
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
 	}
 
-	w.logger.Info("downloading raw video", "videoId", payload.VideoID, "objectKey", payload.RawObjectKey)
+	w.logger.Info("planner downloading raw video", "videoId", payload.VideoID, "objectKey", payload.RawObjectKey)
 	if err := w.storage.DownloadRaw(ctx, payload.RawObjectKey, inputPath); err != nil {
 		return err
 	}
@@ -371,27 +453,116 @@ func (w *Worker) Process(ctx context.Context, payload job.TranscodeJob) error {
 	if err := w.processor.GenerateThumbnail(ctx, inputPath, thumbnailPath); err != nil {
 		return err
 	}
-
-	variants, err := w.processor.GenerateHLS(ctx, inputPath, hlsDir, probe)
-	if err != nil {
-		return err
-	}
-
-	baseKey := "processed-videos/" + payload.VideoID
-	if err := w.uploadHLS(ctx, baseKey, hlsDir, variants); err != nil {
-		return err
-	}
-
 	thumbnailKey := "thumbnails/" + payload.VideoID + "/default.jpg"
 	if err := w.storage.UploadThumbnail(ctx, thumbnailKey, thumbnailPath); err != nil {
 		return err
 	}
-
-	for idx := range variants {
-		variants[idx].PlaylistKey = baseKey + "/" + variants[idx].Quality + "/index.m3u8"
+	if err := w.repo.SaveThumbnail(ctx, payload.VideoID, thumbnailKey); err != nil {
+		return err
 	}
 
-	return w.repo.CompleteJob(ctx, payload.JobID, payload.VideoID, baseKey+"/master.m3u8", thumbnailKey, variants)
+	specs := processor.PlanRenditions(probe.Height)
+	w.logger.Info("planner fanning out renditions", "videoId", payload.VideoID, "count", len(specs))
+	if err := w.repo.FanOutRenditions(ctx, payload.JobID, payload.VideoID, payload.RawBucket, payload.RawObjectKey, specs); err != nil {
+		if database.IsPlanClaimLost(err) {
+			w.logger.Info("plan claim lost before fan-out; another worker owns it", "jobId", payload.JobID)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// ProcessRendition transcodes exactly one quality and records the variant,
+// atomically decrementing the plan's pending counter. The reduce step (and the
+// finalize hand-off when this is the last rendition) happens in CompleteRendition.
+func (w *Worker) ProcessRendition(ctx context.Context, payload job.RenditionJob) error {
+	claimed, err := w.repo.ClaimChildJob(ctx, payload.JobID, payload.VideoID, w.cfg.WorkerID, w.cfg.JobLeaseDuration)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		w.logger.Info("rendition job skipped", "jobId", payload.JobID, "videoId", payload.VideoID, "quality", payload.Spec.Quality)
+		return nil
+	}
+
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go w.heartbeat(hbCtx, payload.JobID)
+
+	workDir := filepath.Join(w.cfg.WorkDir, payload.JobID)
+	inputPath := filepath.Join(workDir, "input.mp4")
+	outDir := filepath.Join(workDir, "out")
+	defer os.RemoveAll(workDir)
+
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return err
+	}
+
+	w.logger.Info("rendition downloading raw video", "videoId", payload.VideoID, "quality", payload.Spec.Quality)
+	if err := w.storage.DownloadRaw(ctx, payload.RawObjectKey, inputPath); err != nil {
+		return err
+	}
+
+	// Re-probe locally for the audio flag so a rendition is self-contained from
+	// just the raw key + spec (the reaper can rebuild its message without probe data).
+	probe, err := w.processor.Probe(ctx, inputPath)
+	if err != nil {
+		return err
+	}
+
+	variant, err := w.processor.GenerateRendition(ctx, inputPath, outDir, payload.Spec, probe.HasAudio)
+	if err != nil {
+		return err
+	}
+
+	baseKey := "processed-videos/" + payload.VideoID + "/" + payload.Spec.Quality
+	if err := w.uploadDir(ctx, baseKey, outDir); err != nil {
+		return err
+	}
+	variant.PlaylistKey = baseKey + "/index.m3u8"
+
+	last, finalizeJobID, err := w.repo.CompleteRendition(ctx, payload.JobID, payload.ParentJobID, payload.VideoID, variant)
+	if err != nil {
+		return err
+	}
+	if last {
+		w.logger.Info("last rendition done; finalize enqueued", "videoId", payload.VideoID, "finalizeJobId", finalizeJobID)
+	}
+	return nil
+}
+
+// ProcessFinalize assembles master.m3u8 from the recorded variants, uploads it,
+// and marks the video ready.
+func (w *Worker) ProcessFinalize(ctx context.Context, payload job.FinalizeJob) error {
+	claimed, err := w.repo.ClaimChildJob(ctx, payload.JobID, payload.VideoID, w.cfg.WorkerID, w.cfg.JobLeaseDuration)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		w.logger.Info("finalize job skipped", "jobId", payload.JobID, "videoId", payload.VideoID)
+		return nil
+	}
+
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go w.heartbeat(hbCtx, payload.JobID)
+
+	variants, err := w.repo.ListVariants(ctx, payload.VideoID)
+	if err != nil {
+		return err
+	}
+	if len(variants) == 0 {
+		return fmt.Errorf("no variants to finalize for video %s", payload.VideoID)
+	}
+
+	masterKey := "processed-videos/" + payload.VideoID + "/master.m3u8"
+	master := processor.BuildMasterPlaylist(variants)
+	if err := w.storage.UploadProcessedBytes(ctx, masterKey, master, processor.ContentType(masterKey)); err != nil {
+		return err
+	}
+
+	return w.repo.CompleteFinalize(ctx, payload.JobID, payload.VideoID, masterKey)
 }
 
 func (w *Worker) heartbeat(ctx context.Context, jobID string) {
@@ -410,31 +581,21 @@ func (w *Worker) heartbeat(ctx context.Context, jobID string) {
 	}
 }
 
-func (w *Worker) uploadHLS(ctx context.Context, baseKey, hlsDir string, variants []job.Variant) error {
-	err := filepath.WalkDir(hlsDir, func(path string, entry os.DirEntry, walkErr error) error {
+// uploadDir uploads every file under dir to the processed bucket, keyed by
+// baseKey + the file's path relative to dir.
+func (w *Worker) uploadDir(ctx context.Context, baseKey, dir string) error {
+	return filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
 			return nil
 		}
-
-		relative, err := filepath.Rel(hlsDir, path)
+		relative, err := filepath.Rel(dir, path)
 		if err != nil {
 			return err
 		}
 		objectKey := baseKey + "/" + filepath.ToSlash(relative)
 		return w.storage.UploadProcessedFile(ctx, objectKey, path, processor.ContentType(path))
 	})
-	if err != nil {
-		return err
-	}
-
-	for _, variant := range variants {
-		if !strings.HasSuffix(variant.PlaylistKey, "index.m3u8") {
-			return fmt.Errorf("variant %s missing playlist", variant.Quality)
-		}
-	}
-
-	return nil
 }

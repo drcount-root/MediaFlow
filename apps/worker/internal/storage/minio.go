@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -51,6 +52,15 @@ func (s *MinIOStorage) DownloadRaw(ctx context.Context, objectKey, destination s
 
 func (s *MinIOStorage) UploadProcessedFile(ctx context.Context, objectKey, path, contentType string) error {
 	return s.uploadFile(ctx, s.processedBucket, objectKey, path, contentType)
+}
+
+// UploadProcessedBytes writes an in-memory object (e.g. the assembled master
+// playlist) to the processed bucket without staging it to a temp file.
+func (s *MinIOStorage) UploadProcessedBytes(ctx context.Context, objectKey string, data []byte, contentType string) error {
+	_, err := s.client.PutObject(ctx, s.processedBucket, objectKey, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
+		ContentType: contentType,
+	})
+	return err
 }
 
 func (s *MinIOStorage) UploadThumbnail(ctx context.Context, objectKey, path string) error {

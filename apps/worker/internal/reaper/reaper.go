@@ -87,10 +87,13 @@ func (r *Reaper) Reap(ctx context.Context) (requeued, failed int, err error) {
 }
 
 type expiredJob struct {
-	jobID        string
-	videoID      string
-	attempts     int
-	rawObjectKey string
+	jobID         string
+	videoID       string
+	attempts      int
+	rawObjectKey  string
+	jobType       string
+	parentJobID   sql.NullString
+	renditionSpec []byte
 }
 
 func (r *Reaper) reapBatch(ctx context.Context) (requeued, failed, scanned int, err error) {
@@ -102,7 +105,8 @@ func (r *Reaper) reapBatch(ctx context.Context) (requeued, failed, scanned int, 
 
 	// Lock only the job rows, and skip any another reaper already holds.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT j.id, j.video_id, j.attempts, COALESCE(v.raw_object_key, '')
+		SELECT j.id, j.video_id, j.attempts, COALESCE(v.raw_object_key, ''),
+			j.job_type, j.parent_job_id, j.rendition_spec
 		FROM video_jobs j
 		JOIN videos v ON v.id = j.video_id
 		WHERE j.status = 'processing' AND j.lease_expires_at < now()
@@ -117,7 +121,7 @@ func (r *Reaper) reapBatch(ctx context.Context) (requeued, failed, scanned int, 
 	var batch []expiredJob
 	for rows.Next() {
 		var e expiredJob
-		if err := rows.Scan(&e.jobID, &e.videoID, &e.attempts, &e.rawObjectKey); err != nil {
+		if err := rows.Scan(&e.jobID, &e.videoID, &e.attempts, &e.rawObjectKey, &e.jobType, &e.parentJobID, &e.renditionSpec); err != nil {
 			rows.Close()
 			return 0, 0, 0, err
 		}
@@ -149,9 +153,16 @@ func (r *Reaper) reapBatch(ctx context.Context) (requeued, failed, scanned int, 
 	return requeued, failed, len(batch), nil
 }
 
-// requeue resets the job to queued and writes a transcode outbox row for the API
-// relay to publish. The video returns to queued so its status reflects reality.
+// requeue resets the job to queued and writes an outbox row (routed to the queue
+// for the job's stage) for the API relay to publish. A plan job restarts the
+// whole pipeline, so the video also returns to queued; a rendition or finalize
+// job is mid-fan-out, so the video stays processing.
 func (r *Reaper) requeue(ctx context.Context, tx *sql.Tx, e expiredJob) error {
+	routingKey, payload, resetVideo, err := r.requeueMessage(e)
+	if err != nil {
+		return err
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE video_jobs
 		SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL, updated_at = now()
@@ -160,34 +171,68 @@ func (r *Reaper) requeue(ctx context.Context, tx *sql.Tx, e expiredJob) error {
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE videos SET status = 'queued', updated_at = now() WHERE id = $1
-	`, e.videoID); err != nil {
-		return err
+	if resetVideo {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE videos SET status = 'queued', updated_at = now() WHERE id = $1
+		`, e.videoID); err != nil {
+			return err
+		}
 	}
 
-	payload, err := json.Marshal(job.TranscodeJob{
-		JobID:        e.jobID,
-		VideoID:      e.videoID,
-		RawBucket:    r.rawBucket,
-		RawObjectKey: e.rawObjectKey,
-		RequestedAt:  time.Now().UTC(),
-	})
-	if err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbox_messages (exchange, routing_key, payload_json)
 		VALUES ($1, $2, $3)
-	`, job.VideoExchange, job.TranscodeRoutingKey, payload); err != nil {
+	`, job.VideoExchange, routingKey, payload); err != nil {
 		return err
 	}
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO video_events (video_id, event_type, message, metadata_json)
-		VALUES ($1, 'video.job.requeued', 'Lease expired; job re-enqueued by reaper.', jsonb_build_object('attempts', $2::int))
-	`, e.videoID, e.attempts)
+		VALUES ($1, 'video.job.requeued', 'Lease expired; job re-enqueued by reaper.', jsonb_build_object('attempts', $2::int, 'stage', $3::text))
+	`, e.videoID, e.attempts, e.jobType)
 	return err
+}
+
+// requeueMessage builds the queue message for re-enqueuing an expired job,
+// rebuilding it entirely from durable DB state so no in-flight context is needed.
+func (r *Reaper) requeueMessage(e expiredJob) (routingKey string, payload []byte, resetVideo bool, err error) {
+	now := time.Now().UTC()
+	switch e.jobType {
+	case job.JobTypeRendition:
+		var spec job.RenditionSpec
+		if err := json.Unmarshal(e.renditionSpec, &spec); err != nil {
+			return "", nil, false, fmt.Errorf("decode rendition_spec for job %s: %w", e.jobID, err)
+		}
+		payload, err = json.Marshal(job.RenditionJob{
+			JobID:        e.jobID,
+			ParentJobID:  e.parentJobID.String,
+			VideoID:      e.videoID,
+			RawBucket:    r.rawBucket,
+			RawObjectKey: e.rawObjectKey,
+			Spec:         spec,
+			RequestedAt:  now,
+		})
+		return job.RenditionRoutingKey, payload, false, err
+	case job.JobTypeFinalize:
+		payload, err = json.Marshal(job.FinalizeJob{
+			JobID:        e.jobID,
+			ParentJobID:  e.parentJobID.String,
+			VideoID:      e.videoID,
+			RawBucket:    r.rawBucket,
+			RawObjectKey: e.rawObjectKey,
+			RequestedAt:  now,
+		})
+		return job.FinalizeRoutingKey, payload, false, err
+	default: // plan (and legacy 'transcode') jobs restart the whole pipeline
+		payload, err = json.Marshal(job.TranscodeJob{
+			JobID:        e.jobID,
+			VideoID:      e.videoID,
+			RawBucket:    r.rawBucket,
+			RawObjectKey: e.rawObjectKey,
+			RequestedAt:  now,
+		})
+		return job.TranscodeRoutingKey, payload, true, err
+	}
 }
 
 // fail terminates a job that has exhausted its attempts.

@@ -94,9 +94,12 @@ func TestPipelineProcessesUploadToReady(t *testing.T) {
 		RequestedAt:  time.Now().UTC(),
 	})
 
-	// 4. Run the worker until the video reaches a terminal state.
+	// 4. Run the worker until the video reaches a terminal state. The planner
+	// fans out rendition jobs through the outbox, so a relay must publish them
+	// (the API owns the relay in production; here a test relay stands in).
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	startTestRelay(t, runCtx, db)
 	go func() { _ = w.Run(runCtx) }()
 
 	status := waitForTerminalStatus(t, db, videoID, 120*time.Second)

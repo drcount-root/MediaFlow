@@ -16,6 +16,18 @@ const (
 	VideoExchange       = "mediaflow.video"
 	TranscodeRoutingKey = "video.transcode"
 
+	// Fan-out routing (M7). The plan job is the one ingest enqueues on
+	// TranscodeRoutingKey. The planner fans out one rendition message per quality
+	// on RenditionRoutingKey; whoever finishes the last rendition enqueues one
+	// finalize message on FinalizeRoutingKey.
+	RenditionRoutingKey = "video.rendition"
+	FinalizeRoutingKey  = "video.finalize"
+
+	// Job types in video_jobs.job_type (M7).
+	JobTypePlan      = "plan"
+	JobTypeRendition = "rendition"
+	JobTypeFinalize  = "finalize"
+
 	// Retry/dead-letter routing (M5.3). A transient failure below max attempts is
 	// republished to RetryRoutingKey with a per-message TTL; that queue dead-letters
 	// back to TranscodeRoutingKey when the TTL expires. Poison and exhausted
@@ -41,8 +53,43 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &pe)
 }
 
+// TranscodeJob is the plan-stage message ingest enqueues on the transcode queue.
 type TranscodeJob struct {
 	JobID        string    `json:"jobId"`
+	VideoID      string    `json:"videoId"`
+	RawBucket    string    `json:"rawBucket"`
+	RawObjectKey string    `json:"rawObjectKey"`
+	RequestedAt  time.Time `json:"requestedAt"`
+}
+
+// RenditionSpec is the single quality a rendition job must produce. It is stored
+// on the job row (rendition_spec) and carried in the queue message so the worker
+// and the reaper agree on what to encode without re-running the planner.
+type RenditionSpec struct {
+	Quality string `json:"quality"`
+	Width   int    `json:"width"`
+	Height  int    `json:"height"`
+	Bitrate int    `json:"bitrate"`
+	Codec   string `json:"codec"`
+}
+
+// RenditionJob is one fanned-out unit of work: transcode exactly one quality.
+type RenditionJob struct {
+	JobID        string        `json:"jobId"`
+	ParentJobID  string        `json:"parentJobId"`
+	VideoID      string        `json:"videoId"`
+	RawBucket    string        `json:"rawBucket"`
+	RawObjectKey string        `json:"rawObjectKey"`
+	Spec         RenditionSpec `json:"spec"`
+	RequestedAt  time.Time     `json:"requestedAt"`
+}
+
+// FinalizeJob assembles the master playlist and marks the video ready once every
+// rendition has finished. It is enqueued by whichever rendition decrements the
+// pending counter to zero.
+type FinalizeJob struct {
+	JobID        string    `json:"jobId"`
+	ParentJobID  string    `json:"parentJobId"`
 	VideoID      string    `json:"videoId"`
 	RawBucket    string    `json:"rawBucket"`
 	RawObjectKey string    `json:"rawObjectKey"`

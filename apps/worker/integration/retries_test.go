@@ -93,6 +93,7 @@ func TestPoisonMessageDeadLettered(t *testing.T) {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	startTestRelay(t, runCtx, db)
 	go func() { _ = w.Run(runCtx) }()
 
 	publishRaw(t, job.TranscodeRoutingKey, []byte("{not valid json"))
@@ -222,8 +223,8 @@ func TestRedeliveryOfReadyVideoIsSkipped(t *testing.T) {
 	}
 
 	w := newTestWorker(t, db)
-	if err := w.Process(ctx, job.TranscodeJob{JobID: jobID, VideoID: videoID, RawBucket: rawBucket, RawObjectKey: rawKey, RequestedAt: time.Now().UTC()}); err != nil {
-		t.Fatalf("Process on a ready video should be a no-op, got: %v", err)
+	if err := w.ProcessPlan(ctx, job.TranscodeJob{JobID: jobID, VideoID: videoID, RawBucket: rawBucket, RawObjectKey: rawKey, RequestedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("ProcessPlan on a ready video should be a no-op, got: %v", err)
 	}
 
 	var (

@@ -1,0 +1,102 @@
+# App overlay for the API and the (horizontally scalable) worker, layered on top
+# of docker-compose.yml which provides the backing services. Bring the whole
+# system up — with N workers — in one command:
+#
+#   docker compose -f infrastructure/docker-compose.yml \
+#                  -f infrastructure/docker-compose.app.yml \
+#                  up -d --build --scale worker=3
+#
+# The worker service has no container_name and no published ports so Compose can
+# run an arbitrary number of replicas. App containers reach the backing services
+# by their compose service names (postgres/rabbitmq/minio/redis), not the host
+# ports the base file publishes.
+name: mediaflow
+
+services:
+  # One-shot schema migration. Idempotent (cmd/migrate tracks applied versions in
+  # schema_migrations), so it is safe whether the Postgres volume is fresh or was
+  # seeded by an earlier run's init scripts. api/worker wait for it to complete.
+  migrate:
+    build:
+      context: ../apps/api
+      target: migrate
+    image: mediaflow-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://mediaflow:mediaflow@postgres:5432/mediaflow?sslmode=disable
+      MIGRATIONS_DIR: /migrations
+    volumes:
+      - ./migrations:/migrations:ro
+    restart: "no"
+
+  api:
+    build:
+      context: ../apps/api
+      target: api
+    image: mediaflow-api
+    container_name: mediaflow-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: docker
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://mediaflow:mediaflow@postgres:5432/mediaflow?sslmode=disable
+      RABBITMQ_URL: amqp://mediaflow:mediaflow@rabbitmq:5672/
+      REDIS_ADDR: redis:6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: mediaflow
+      MINIO_SECRET_KEY: mediaflow-secret
+      MINIO_USE_SSL: "false"
+      OUTBOX_POLL_INTERVAL: 250ms
+      # The fan-out speedup harness uploads through the legacy proxy endpoint.
+      ENABLE_LEGACY_UPLOAD: "true"
+      MAX_UPLOAD_BYTES: "524288000"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../apps/worker
+    image: mediaflow-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: docker
+      DATABASE_URL: postgres://mediaflow:mediaflow@postgres:5432/mediaflow?sslmode=disable
+      RABBITMQ_URL: amqp://mediaflow:mediaflow@rabbitmq:5672/
+      REDIS_ADDR: redis:6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: mediaflow
+      MINIO_SECRET_KEY: mediaflow-secret
+      MINIO_USE_SSL: "false"
+      # One rendition at a time per container, so replica count == parallel
+      # renditions — the cleanest knob for the 3-vs-1 speedup measurement.
+      WORKER_CONCURRENCY: "1"
+      JOB_HEARTBEAT_INTERVAL: "10s"
+      REAPER_INTERVAL: "15s"
+    # Each worker is a bounded compute unit (like a pod with a CPU limit), so
+    # replica count maps to real added throughput. Without a cap, a single ffmpeg
+    # encode saturates the shared host cores and extra replicas only timeshare —
+    # fan-out then shows little speedup on one machine (it pays off across nodes).
+    # Override with WORKER_CPUS; default 2.
+    cpus: ${WORKER_CPUS:-2}
+    restart: unless-stopped

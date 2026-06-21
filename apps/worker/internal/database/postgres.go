@@ -479,6 +479,117 @@ func (r *Repository) FailJob(ctx context.Context, jobID, videoID string, cause e
 	return tx.Commit()
 }
 
+// FailVideoFromRendition terminally fails a video because one rendition exhausted
+// its retries (or hit a permanent error). In a single transaction it: locks the
+// parent plan row (serialising with CompleteRendition's decrement/finalize hand-off
+// on the same row, so a concurrent last-rendition completion can't finalise a video
+// we are failing); marks this rendition job failed; cancels sibling rendition and
+// finalize jobs still queued or processing (so they stop retrying and the reaper
+// ignores them — a sibling mid-transcode finds its job no longer `processing` and
+// no-ops in CompleteRendition); marks the video failed; and records an event
+// listing the renditions that had already completed and are now discarded.
+//
+// A terminally-failed rendition never decrements the pending counter, so finalize
+// can never have fired for this video — cleanup is about stopping in-flight
+// siblings and surfacing the failure promptly, not unwinding a completed pipeline.
+func (r *Repository) FailVideoFromRendition(ctx context.Context, renditionJobID, videoID, parentJobID string, cause error) error {
+	message := "unknown processing error"
+	if cause != nil {
+		message = cause.Error()
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Lock the plan row first to serialise with the aggregation counter.
+	if parentJobID != "" {
+		if _, err := tx.ExecContext(ctx, `SELECT 1 FROM video_jobs WHERE id = $1 FOR UPDATE`, parentJobID); err != nil {
+			return err
+		}
+	}
+
+	// Record the failed quality (if known) for the audit log before we touch it.
+	var failedQuality sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT rendition_spec->>'quality' FROM video_jobs WHERE id = $1
+	`, renditionJobID).Scan(&failedQuality); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE video_jobs
+		SET status = 'failed', last_error = $2, claimed_by = NULL, lease_expires_at = NULL, updated_at = now()
+		WHERE id = $1
+	`, renditionJobID, message); err != nil {
+		return err
+	}
+
+	// Cancel siblings (other renditions + the finalize job) still in flight so they
+	// stop retrying; completed siblings are left as-is (their objects are orphaned).
+	if parentJobID != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE video_jobs
+			SET status = 'failed', last_error = 'cancelled: sibling rendition failed',
+				claimed_by = NULL, lease_expires_at = NULL, updated_at = now()
+			WHERE parent_job_id = $1 AND id <> $2 AND status IN ('queued', 'processing')
+		`, parentJobID, renditionJobID); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE videos SET status = 'failed', error_message = $2, updated_at = now()
+		WHERE id = $1 AND status <> 'failed'
+	`, videoID, message); err != nil {
+		return err
+	}
+
+	// Note which renditions had already finished (now discarded) for the audit log.
+	completed, err := completedQualities(ctx, tx, videoID)
+	if err != nil {
+		return err
+	}
+	completedJSON, err := json.Marshal(completed)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO video_events (video_id, event_type, message, metadata_json)
+		VALUES ($1, 'video.processing.failed', $2,
+			jsonb_build_object('failedQuality', $3::text, 'completedRenditions', $4::jsonb))
+	`, videoID, message, failedQuality.String, string(completedJSON)); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// completedQualities returns the qualities already recorded for a video, highest
+// bitrate first — the renditions that finished before a sibling doomed the video.
+func completedQualities(ctx context.Context, tx *sql.Tx, videoID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT quality FROM video_variants WHERE video_id = $1 ORDER BY bitrate DESC
+	`, videoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	qualities := []string{}
+	for rows.Next() {
+		var q string
+		if err := rows.Scan(&q); err != nil {
+			return nil, err
+		}
+		qualities = append(qualities, q)
+	}
+	return qualities, rows.Err()
+}
+
 func (r *Repository) addEvent(ctx context.Context, videoID, eventType, message string) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO video_events (video_id, event_type, message)

@@ -24,8 +24,11 @@ const (
 	transcodeQueue = "video.transcode"
 	renditionQueue = "video.rendition"
 	finalizeQueue  = "video.finalize"
-	retryQueue     = "video.transcode.retry"
-	dlqQueue       = "video.transcode.dlq"
+
+	retryQueue          = "video.transcode.retry"
+	renditionRetryQueue = "video.rendition.retry"
+	finalizeRetryQueue  = "video.finalize.retry"
+	dlqQueue            = "video.transcode.dlq"
 )
 
 const (
@@ -100,10 +103,10 @@ func New(cfg config.Config, logger *slog.Logger, db *sql.DB, objectStorage *stor
 	}, nil
 }
 
-// declareTopology declares the fan-out queues (plan/rendition/finalize), the
-// transcode retry queue (which dead-letters back to the main transcode queue
-// once a message's TTL expires), the terminal DLQ, and their bindings on the
-// shared mediaflow.video exchange.
+// declareTopology declares the fan-out queues (plan/rendition/finalize), one retry
+// queue per stage (each dead-letters back to its own stage queue once a message's
+// TTL expires, so a retrying rendition never redoes the others), the shared
+// terminal DLQ, and their bindings on the mediaflow.video exchange.
 func declareTopology(channel *amqp.Channel) error {
 	if err := channel.ExchangeDeclare("mediaflow.video", amqp.ExchangeDirect, true, false, false, false, nil); err != nil {
 		return err
@@ -122,17 +125,24 @@ func declareTopology(channel *amqp.Channel) error {
 		}
 	}
 
-	// Retry queue: no consumer. A message published here waits out its per-message
-	// TTL, then the broker dead-letters it back to the main transcode queue.
-	if _, err := channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
-		"x-dead-letter-exchange":    "mediaflow.video",
-		"x-dead-letter-routing-key": transcodeQueue,
-	}); err != nil {
-		return err
+	// Retry queues: no consumer. A message published to one waits out its per-message
+	// TTL, then the broker dead-letters it back to the stage's main queue.
+	for _, rq := range []struct{ name, key, deadLetterTo string }{
+		{retryQueue, job.RetryRoutingKey, transcodeQueue},
+		{renditionRetryQueue, job.RenditionRetryRoutingKey, renditionQueue},
+		{finalizeRetryQueue, job.FinalizeRetryRoutingKey, finalizeQueue},
+	} {
+		if _, err := channel.QueueDeclare(rq.name, true, false, false, false, amqp.Table{
+			"x-dead-letter-exchange":    "mediaflow.video",
+			"x-dead-letter-routing-key": rq.deadLetterTo,
+		}); err != nil {
+			return err
+		}
+		if err := channel.QueueBind(rq.name, rq.key, "mediaflow.video", false, nil); err != nil {
+			return err
+		}
 	}
-	if err := channel.QueueBind(retryQueue, job.RetryRoutingKey, "mediaflow.video", false, nil); err != nil {
-		return err
-	}
+
 	if _, err := channel.QueueDeclare(dlqQueue, true, false, false, false, nil); err != nil {
 		return err
 	}
@@ -243,9 +253,8 @@ func (w *Worker) handleDelivery(ctx context.Context, delivery amqp.Delivery, han
 	}
 }
 
-// handlePlan runs the plan stage and applies the M5 retry/DLQ policy on failure
-// (the plan job has a retry queue; renditions and finalize recover via the
-// reaper — see handleChildFailure).
+// handlePlan runs the plan stage and applies the shared retry/DLQ policy on
+// failure (see retryOrFail).
 func (w *Worker) handlePlan(ctx context.Context, delivery amqp.Delivery) error {
 	var payload job.TranscodeJob
 	if err := json.Unmarshal(delivery.Body, &payload); err != nil {
@@ -253,7 +262,12 @@ func (w *Worker) handlePlan(ctx context.Context, delivery amqp.Delivery) error {
 	}
 
 	if procErr := w.ProcessPlan(ctx, payload); procErr != nil {
-		w.handleFailure(ctx, delivery, payload, procErr)
+		w.retryOrFail(delivery, stage{
+			name:     "plan",
+			jobID:    payload.JobID,
+			videoID:  payload.VideoID,
+			retryKey: job.RetryRoutingKey,
+		}, procErr)
 		return nil
 	}
 	return delivery.Ack(false)
@@ -266,7 +280,15 @@ func (w *Worker) handleRendition(ctx context.Context, delivery amqp.Delivery) er
 	}
 
 	if procErr := w.ProcessRendition(ctx, payload); procErr != nil {
-		return w.handleChildFailure(delivery, payload.JobID, payload.VideoID, "rendition", procErr)
+		w.retryOrFail(delivery, stage{
+			name:        "rendition",
+			jobID:       payload.JobID,
+			videoID:     payload.VideoID,
+			parentJobID: payload.ParentJobID,
+			retryKey:    job.RenditionRetryRoutingKey,
+			rendition:   true,
+		}, procErr)
+		return nil
 	}
 	return delivery.Ack(false)
 }
@@ -278,7 +300,13 @@ func (w *Worker) handleFinalize(ctx context.Context, delivery amqp.Delivery) err
 	}
 
 	if procErr := w.ProcessFinalize(ctx, payload); procErr != nil {
-		return w.handleChildFailure(delivery, payload.JobID, payload.VideoID, "finalize", procErr)
+		w.retryOrFail(delivery, stage{
+			name:     "finalize",
+			jobID:    payload.JobID,
+			videoID:  payload.VideoID,
+			retryKey: job.FinalizeRetryRoutingKey,
+		}, procErr)
+		return nil
 	}
 	return delivery.Ack(false)
 }
@@ -294,46 +322,50 @@ func (w *Worker) deadLetterPoison(ctx context.Context, delivery amqp.Delivery, c
 	return delivery.Ack(false)
 }
 
-// handleChildFailure handles a rendition or finalize error. Unlike the plan
-// stage, child stages do not have their own retry queue (M7 slice A): the job
-// row is left `processing` with its lease, and the reaper requeues it (below max
-// attempts) or fails the video (at max). Dropping the delivery (Nack, no
-// requeue) avoids a hot loop; the reaper drives recovery on the lease timeout.
-func (w *Worker) handleChildFailure(delivery amqp.Delivery, jobID, videoID, stage string, procErr error) error {
-	w.logger.Error("child stage failed; leaving for reaper",
-		"stage", stage, "jobId", jobID, "videoId", videoID, "error", procErr)
-	return delivery.Nack(false, false)
+// stage describes a failed pipeline stage for the shared retry/DLQ path: which
+// job/video failed, the retry queue its transient failures go to, and — for a
+// rendition — the parent plan job whose siblings must be cancelled on terminal
+// failure.
+type stage struct {
+	name        string
+	jobID       string
+	videoID     string
+	parentJobID string // rendition only; "" for plan/finalize
+	retryKey    string
+	rendition   bool
 }
 
-// handleFailure decides what to do with a plan job that failed: schedule a
-// backed-off retry (transient, below max attempts) or dead-letter it and mark it
-// failed (permanent error, or attempts exhausted). Use a background context for
-// the DB and broker writes so a cancelled ctx (shutdown) still records the
-// outcome.
-func (w *Worker) handleFailure(ctx context.Context, delivery amqp.Delivery, payload job.TranscodeJob, procErr error) {
+// retryOrFail applies the M5 retry/DLQ policy to any failed stage: schedule a
+// backed-off retry (transient, below max attempts) on the stage's retry queue, or
+// dead-letter the message and fail terminally (permanent error, or attempts
+// exhausted). A terminal rendition failure fails the *whole video* and cancels its
+// siblings (FailVideoFromRendition); plan/finalize just fail the video (FailJob).
+// A background context is used for the DB and broker writes so a cancelled ctx
+// (shutdown) still records the outcome.
+func (w *Worker) retryOrFail(delivery amqp.Delivery, st stage, procErr error) {
 	bg := context.Background()
-	attempts, err := w.repo.JobAttempts(bg, payload.JobID)
+	attempts, err := w.repo.JobAttempts(bg, st.jobID)
 	if err != nil {
 		// Can't read state to decide — requeue the delivery and let the reaper or a
 		// later attempt sort it out rather than guessing.
-		w.logger.Error("could not read attempts after failure", "jobId", payload.JobID, "error", err)
+		w.logger.Error("could not read attempts after failure", "stage", st.name, "jobId", st.jobID, "error", err)
 		_ = delivery.Nack(false, true)
 		return
 	}
 
 	if retry, delay := classifyFailure(procErr, attempts, w.cfg.JobMaxAttempts, w.cfg.RetryBaseDelay); retry {
-		w.logger.Warn("scheduling retry", "jobId", payload.JobID, "videoId", payload.VideoID,
+		w.logger.Warn("scheduling retry", "stage", st.name, "jobId", st.jobID, "videoId", st.videoID,
 			"attempts", attempts, "delay", delay.String(), "error", procErr)
 		// Publish-first: the retry message is durably enqueued (with a confirm)
 		// before we release the DB claim. If anything below fails, the job is still
 		// `processing` with a lease, so the reaper remains the backstop.
-		if err := w.publishRetry(bg, delivery.Body, delay); err != nil {
-			w.logger.Error("retry publish failed", "jobId", payload.JobID, "error", err)
+		if err := w.publishRetry(bg, st.retryKey, delivery.Body, delay); err != nil {
+			w.logger.Error("retry publish failed", "stage", st.name, "jobId", st.jobID, "error", err)
 			_ = delivery.Nack(false, true)
 			return
 		}
-		if err := w.repo.MarkQueuedForRetry(bg, payload.JobID, payload.VideoID, procErr, attempts, delay); err != nil {
-			w.logger.Error("mark-for-retry failed", "jobId", payload.JobID, "error", err)
+		if err := w.repo.MarkQueuedForRetry(bg, st.jobID, st.videoID, procErr, attempts, delay); err != nil {
+			w.logger.Error("mark-for-retry failed", "stage", st.name, "jobId", st.jobID, "error", err)
 		}
 		_ = delivery.Ack(false)
 		return
@@ -341,13 +373,19 @@ func (w *Worker) handleFailure(ctx context.Context, delivery amqp.Delivery, payl
 
 	// Terminal: permanent error or out of attempts.
 	reason := terminalReason(procErr, attempts, w.cfg.JobMaxAttempts)
-	w.logger.Error("job failed permanently", "jobId", payload.JobID, "videoId", payload.VideoID,
+	w.logger.Error("stage failed permanently", "stage", st.name, "jobId", st.jobID, "videoId", st.videoID,
 		"attempts", attempts, "reason", reason)
-	if err := w.repo.FailJob(bg, payload.JobID, payload.VideoID, procErr); err != nil {
-		w.logger.Error("fail-job failed", "jobId", payload.JobID, "error", err)
+	if st.rendition {
+		if err := w.repo.FailVideoFromRendition(bg, st.jobID, st.videoID, st.parentJobID, procErr); err != nil {
+			w.logger.Error("fail-video-from-rendition failed", "jobId", st.jobID, "error", err)
+		}
+	} else {
+		if err := w.repo.FailJob(bg, st.jobID, st.videoID, procErr); err != nil {
+			w.logger.Error("fail-job failed", "jobId", st.jobID, "error", err)
+		}
 	}
 	if err := w.publishDLQ(bg, delivery.Body, reason); err != nil {
-		w.logger.Error("dead-letter publish failed", "jobId", payload.JobID, "error", err)
+		w.logger.Error("dead-letter publish failed", "jobId", st.jobID, "error", err)
 	}
 	_ = delivery.Ack(false)
 }
@@ -372,10 +410,10 @@ func terminalReason(err error, attempts, maxAttempts int) string {
 	return fmt.Sprintf("attempts exhausted (%d/%d): %s", attempts, maxAttempts, err.Error())
 }
 
-// publishRetry republishes the original message body to the retry queue with a
-// per-message TTL, blocking until the broker confirms it.
-func (w *Worker) publishRetry(ctx context.Context, body []byte, delay time.Duration) error {
-	return w.confirmedPublish(ctx, job.RetryRoutingKey, amqp.Publishing{
+// publishRetry republishes the original message body to the given stage's retry
+// queue with a per-message TTL, blocking until the broker confirms it.
+func (w *Worker) publishRetry(ctx context.Context, retryKey string, body []byte, delay time.Duration) error {
+	return w.confirmedPublish(ctx, retryKey, amqp.Publishing{
 		DeliveryMode: amqp.Persistent,
 		ContentType:  "application/json",
 		Timestamp:    time.Now().UTC(),

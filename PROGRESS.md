@@ -1,10 +1,10 @@
 # MediaFlow Progress Tracker
 
-Last updated: 2026-06-21
+Last updated: 2026-06-22
 
 ## Overall Status
 
-Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestones 4, 5, and 6 done; Milestone 7 in progress (slice A done). Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
+Status: Phase 1 (MVP, Milestones 0–3) complete. Phase 2 (Milestones 4–10) in progress — Milestones 4, 5, and 6 done; Milestone 7 in progress (slices A and B done). Phase 3 (Milestones 11–12) and Phase 4 capstones follow.
 
 Current focus:
 
@@ -22,10 +22,23 @@ Milestone 7: Distributed Transcoding — IN PROGRESS
     rebuilding rendition msgs from rendition_spec). Idempotent at every stage;
     aggregation race-safe via the plan row's update lock. Proven by
     TestFanOutProducesAllRenditions (720p -> 3 renditions -> ready, 3-stream
-    master). Child-stage failures recover via the reaper (per-stage backoff is
-    slice B).
-  next: slice B (per-rendition retry/DLQ, partial-failure cleanup, aggregation-
-    race + kill-drill proofs), then slice C (3-worker speedup measurement).
+    master).
+  slice B (per-stage retries + partial-failure cleanup) done (ADR 0012): each
+    stage now has its own retry queue (video.{transcode,rendition,finalize}.retry)
+    that dead-letters back to its OWN main queue, so a retrying rendition re-runs
+    as a rendition and never restarts the plan. One unified retryOrFail applies the
+    M5 backoff/DLQ policy to all three stages. A terminally-failed rendition calls
+    FailVideoFromRendition: locks the plan row (serialises with the counter), fails
+    the video, cancels sibling jobs still in flight, and records the failed +
+    already-completed qualities in a video.processing.failed event — the video
+    converges to failed immediately instead of waiting for a finalize that (since a
+    doomed rendition never decrements) would never fire. Proven by
+    TestAggregationRaceFinalizesOnce (concurrent completes -> exactly one finalize),
+    TestRenditionTerminalFailureCleansUp, TestRenditionExhaustsRetriesFailsVideo
+    (-> failed + DLQ), TestChildRetryQueuesDeadLetterBackToStage; kill -9 drill
+    runbook in ADR 0012 (crash recovery stays with the reaper).
+  next: slice C (docker compose --scale worker=3 speedup measurement + queue-depth
+    autoscaling experiment, ADR 0013).
 ```
 
 See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
@@ -41,7 +54,7 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 | 4. CI and Integration Test Harness | Done | GitHub Actions + testcontainers-go integration tests (Postgres/RabbitMQ/MinIO, full upload→ready flow). CI green on PR #1 and required via a ruleset on a public, protected `main`. ADR: `docs/adr/0001-ci-and-integration-harness.md`. |
 | 5. Correctness Under Failure | Done | Slice A (transactional outbox) done: video+job+outbox in one tx, no direct publish, relay loop with confirms (ADR `0002`). Slice B (leases+reaper) done: claims carry `claimed_by`+`lease_expires_at`, workers heartbeat while FFmpeg runs, reaper requeues expired leases via the outbox below `JOB_MAX_ATTEMPTS` / fails them at max (ADR `0003`). Slice C (retries/DLQ) done: transient failures publish to `video.transcode.retry` (per-message TTL `base·2^attempts`, DLX back to main), poison/exhausted/permanent → `video.transcode.dlq`, permanent failures (corrupt input / no video stream) skip retries; publish-first ordering keeps the reaper as backstop (ADR `0004`). Slice D (idempotency+shutdown) done: `Idempotency-Key` on upload (partial unique index, replay returns original with 200, race recovers via 23505), graceful SIGTERM (drain in-flight job within `WORKER_SHUTDOWN_GRACE`, reaper covers overruns), retry hygiene verified (skip-if-ready, variant clear, deterministic keys) (ADR `docs/adr/0005-idempotency-and-graceful-shutdown.md`). RabbitMQ-down drill done: upload stays 201 with the broker down (request path is broker-independent); the drill exposed a relay that held one connection for life and never recovered, fixed with a lazy-reconnecting publisher so the outbox drains automatically on broker return — no API restart (ADR `docs/adr/0006-relay-broker-reconnect.md`). |
 | 6. Scalable Ingest | Done | Slice A (sessions + presigned parts) done: `upload_sessions` table (migration `000005`, status enum `pending\|uploading\|completed\|aborted\|expired`), control-plane endpoints (`POST /uploads`, `GET /uploads/:id`, `GET /uploads/:id/parts/:n/url`, `DELETE /uploads/:id`), MinIO multipart via `minio.Core`, size/part validation at creation, resume by listing parts from object storage (ADR `0007`). Slice B (completion+validation+enqueue) done: `POST /uploads/:id/complete` validates declared ETags + assembled size against what object storage holds (tampered/short/oversize → clean `422`), finalizes multipart with stored ETags, then creates video+job+events+outbox in one tx (reuses M5) and links the session; completion is idempotent (replay returns the same video, concurrent completions race-safe via a guarded UPDATE). Live drill: a 7MiB MP4 uploaded as two presigned parts straight to MinIO (PUTs hit `:9000`, never the API on `:8080`), completed, and the worker drove it to `ready` with 2 variants; outbox drained 1/1 (ADR `docs/adr/0008-upload-completion-validation.md`). Slice C (expiry sweep) done: a background sweeper (mirrors the outbox relay; `UPLOAD_SWEEP_INTERVAL` default 5m) expires `pending`/`uploading` sessions past `expires_at` via a guarded claim-first `UPDATE` (race-safe against a concurrent completion) and aborts their orphaned MinIO multipart uploads; abort failures are logged and leave the row `expired` (MinIO lifecycle is the backstop). No schema change — the `expired` enum + `expires_at` index shipped in `000005`. Integration `TestUploadSweepExpiresAbandonedSession` proves against real MinIO that the staged part is gone after the sweep (ADR `docs/adr/0009-upload-session-expiry-sweep.md`). Slice D (web uploader + retire legacy proxy) done: browser chunked uploader (`lib/uploads.ts`) slices the file and PUTs parts directly to MinIO with 4-lane bounded concurrency, per-part presigned URLs, 4-attempt backoff retry, and a shared `AbortController` for cancel; real byte-level progress via XHR upload events; resume-after-reload keyed on a `localStorage` file-identity record (re-select the same file → only the missing parts upload). Legacy `POST /videos/upload` is now gated behind `ENABLE_LEGACY_UPLOAD` (default off; handler kept for M10 proxy-vs-direct benchmarks) (ADR `docs/adr/0010-web-chunked-uploader.md`). |
-| 7. Distributed Transcoding | In progress | Slice A (fan-out engine) done: plan→rendition→finalize across `video.transcode`/`video.rendition`/`video.finalize`; migration `000006` (`parent_job_id`/`pending_renditions`/`rendition_spec`); atomic `UPDATE ... RETURNING` aggregation counter; job-type-aware reaper; idempotent + race-safe; child-stage failures recover via the reaper (ADR `0011`). Remaining: per-rendition retry/DLQ + partial-failure cleanup (slice B), 3-worker speedup measurement (slice C). |
+| 7. Distributed Transcoding | In progress | Slice A (fan-out engine) done: plan→rendition→finalize across `video.transcode`/`video.rendition`/`video.finalize`; migration `000006` (`parent_job_id`/`pending_renditions`/`rendition_spec`); atomic `UPDATE ... RETURNING` aggregation counter; job-type-aware reaper; idempotent + race-safe (ADR `0011`). Slice B (per-stage retries + partial-failure cleanup) done: per-stage retry queues (`video.{transcode,rendition,finalize}.retry`) each dead-letter back to their own main queue; one unified `retryOrFail` applies the M5 backoff/DLQ policy to all stages; a terminally-failed rendition calls `FailVideoFromRendition` (locks the plan row, fails the video, cancels in-flight siblings, records failed+completed qualities) so the video converges to `failed` immediately. Proven by `TestAggregationRaceFinalizesOnce` (no double-finalize), `TestRenditionTerminalFailureCleansUp`, `TestRenditionExhaustsRetriesFailsVideo`, `TestChildRetryQueuesDeadLetterBackToStage`; kill-drill runbook in ADR `0012`. Remaining: 3-worker speedup measurement + queue-depth autoscaling (slice C). |
 | 8. Serving At Scale | Not started | Private buckets, manifest rewriting with HMAC-signed segment URLs, nginx edge cache, Redis, SSE status push. |
 | 9. Observability | Not started | OpenTelemetry traces across the queue, Prometheus metrics, Jaeger + Grafana dashboards. |
 | 10. Proof: SLOs, Load, Chaos, DR | Not started | Stated SLOs, k6 load tests, scripted chaos scenarios, PITR restore drill, postmortems, ADRs. |
@@ -191,14 +204,14 @@ See `MEDIAFLOW_PLAN.md` for the design behind each milestone.
 - [x] Split worker into planner, rendition, and finalize consumers (one process consumes all three queues)
 - [x] Planner: probe, thumbnail, plan renditions, fan out `video.rendition` jobs via the outbox (one tx)
 - [x] Rendition worker: transcode exactly one quality, upload its playlist and segments
-- [x] Apply M5 leases per rendition (claim + heartbeat). Per-rendition *retry* (one rendition retries without redoing others) is slice B; slice A recovers child failures via the reaper
+- [x] Apply M5 leases per rendition (claim + heartbeat). Per-rendition *retry* done (slice B): each stage has its own retry queue (`video.{transcode,rendition,finalize}.retry`) dead-lettering back to its own main queue, so one rendition retries without redoing the others; unified `retryOrFail` policy. Worker crashes still recover via the reaper
 - [x] Atomic completion counter (`UPDATE ... RETURNING`); last rendition triggers finalize via the outbox
 - [x] Finalizer: write `master.m3u8` from recorded variants, mark video `ready` (variants are inserted per-rendition on completion, upsert-safe)
-- [ ] Partial failure: exhausted rendition fails the video and cleans up siblings (basic fail-via-reaper works; explicit sibling cleanup is slice B)
+- [x] Partial failure: exhausted rendition fails the video and cleans up siblings (slice B — `FailVideoFromRendition`: plan-row lock serialises with the counter, fails the video, cancels in-flight siblings, records failed+completed qualities in `video.processing.failed`; ADR `0012`)
 - [ ] Run and document `docker compose up --scale worker=3` (slice C)
 - [ ] Measure parallel speedup: 3 workers vs 1 on the same source video (slice C)
 - [ ] Autoscaling experiment: scale workers on queue depth, record results (slice C)
-- [x] Tests: fan-out + aggregation (`TestFanOutProducesAllRenditions`); aggregation race + partial failure are slice B
+- [x] Tests: fan-out + aggregation (`TestFanOutProducesAllRenditions`); aggregation race (`TestAggregationRaceFinalizesOnce` — concurrent completes never double-finalize); partial failure (`TestRenditionTerminalFailureCleansUp`, `TestRenditionExhaustsRetriesFailsVideo`); per-stage retry topology (`TestChildRetryQueuesDeadLetterBackToStage`); kill-drill runbook in ADR `0012`
 - [ ] Stretch: segment-level parallel transcode and playlist stitching
 
 ### Milestone 8: Serving At Scale

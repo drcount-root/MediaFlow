@@ -28,12 +28,15 @@ const (
 	JobTypeRendition = "rendition"
 	JobTypeFinalize  = "finalize"
 
-	// Retry/dead-letter routing (M5.3). A transient failure below max attempts is
-	// republished to RetryRoutingKey with a per-message TTL; that queue dead-letters
-	// back to TranscodeRoutingKey when the TTL expires. Poison and exhausted
-	// messages go to DLQRoutingKey for inspection.
-	RetryRoutingKey = "video.transcode.retry"
-	DLQRoutingKey   = "video.transcode.dlq"
+	// Retry/dead-letter routing (M5.3, extended per-stage in M7 slice B). A transient
+	// failure below max attempts is republished to the stage's retry key with a
+	// per-message TTL; that queue dead-letters back to the stage's main queue when
+	// the TTL expires, so one quality retrying never redoes the others. Poison and
+	// exhausted messages from every stage go to the shared DLQRoutingKey.
+	RetryRoutingKey          = "video.transcode.retry"
+	RenditionRetryRoutingKey = "video.rendition.retry"
+	FinalizeRetryRoutingKey  = "video.finalize.retry"
+	DLQRoutingKey            = "video.transcode.dlq"
 )
 
 // PermanentError marks a failure that retrying cannot fix — a corrupt upload, a

@@ -244,7 +244,7 @@ func TestRedeliveryOfReadyVideoIsSkipped(t *testing.T) {
 
 // --- helpers ---
 
-func newTestWorker(t *testing.T, db *sql.DB) *worker.Worker {
+func newTestWorker(t *testing.T, db *sql.DB, opts ...func(*config.Config)) *worker.Worker {
 	t.Helper()
 	cfg := config.Config{
 		DatabaseURL:          infra.databaseURL,
@@ -267,6 +267,9 @@ func newTestWorker(t *testing.T, db *sql.DB) *worker.Worker {
 		RetryBaseDelay:       30 * time.Second,
 		ShutdownGrace:        60 * time.Second,
 	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	objStore, err := storage.NewMinIOStorage(
 		cfg.MinIOEndpoint, cfg.MinIOAccessKey, cfg.MinIOSecretKey, cfg.MinIOUseSSL,
 		cfg.MinIORawBucket, cfg.MinIOProcessedBucket, cfg.MinIOThumbnailBucket,
@@ -287,7 +290,11 @@ func purgeQueues(t *testing.T) {
 	conn, ch := dialChannel(t)
 	defer conn.Close()
 	defer ch.Close()
-	for _, q := range []string{job.TranscodeRoutingKey, job.RetryRoutingKey, job.DLQRoutingKey} {
+	for _, q := range []string{
+		job.TranscodeRoutingKey, job.RenditionRoutingKey, job.FinalizeRoutingKey,
+		job.RetryRoutingKey, job.RenditionRetryRoutingKey, job.FinalizeRetryRoutingKey,
+		job.DLQRoutingKey,
+	} {
 		if _, err := ch.QueuePurge(q, false); err != nil {
 			t.Fatalf("purge %s: %v", q, err)
 		}
